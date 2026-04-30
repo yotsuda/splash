@@ -1,12 +1,10 @@
-# ripple
+# Ripple — REPL-sharing MCP for AI Co-Driving
 
 <div align="center">
   <img src="https://github.com/user-attachments/assets/1343f694-1c05-4899-9faa-d2b1138aa3ba" alt="social-image" width="640" />
 </div>
 
 **A REPL-sharing MCP server for AI that actually holds a session.** Shell, Python, Node, a language debugger — whatever you'd open a REPL window for, ripple keeps it live between tool calls. Load `Import-Module Az` once and let AI run 50 follow-up cmdlets in milliseconds each; drop into `pdb` once and let AI step, inspect, and fix without restarting the process. Watch every command happen in a real terminal window — the same one you can type into yourself.
-
-> **Renamed from `splash` (v0.8.0).** The project shipped as `splashshell` on npm for v0.1.0 – v0.5.0, was renamed to `@ytsuda/splash` for v0.7.0, and renamed again to `@ytsuda/ripple` starting with v0.8.0 once the adapter framework grew past shells into any REPL. `@ytsuda/splash` and `splashshell` are both deprecated; uninstall them and install `@ytsuda/ripple` to keep receiving updates. The GitHub repo moved from `yotsuda/splash` to `yotsuda/ripple`; GitHub redirects old clone URLs automatically.
 
 ## Install
 
@@ -38,7 +36,13 @@ The `@latest` tag is important: without it, npx will happily keep reusing a stal
 
 ## Why ripple?
 
-Other shell MCP servers are either **stateless** (fresh subshell per command, nothing persists) or **headless** (persistent PTY, but invisible to you). ripple is neither — and that unlocks things the others can't do.
+ripple gives AI a **stateful and visible** REPL session — the same window you can read along with and type into yourself. That combination unlocks workflows other MCP servers can't support: secrets the AI never sees, full PowerShell module ecosystems, real debugger sessions.
+
+### Sensitive operations stay sensitive
+
+When a command needs a passphrase, MFA code, or other secret — `Read-Host -AsSecureString`, `gpg --sign`, `ssh-add`, `sudo`, cloud CLI MFA prompts — you type it directly into the visible window. The keystrokes go to the running program, not to the terminal output stream the AI sees. The AI orchestrates the workflow ("run the publish build, sign with my key, then push the tag") but never sees the secret itself.
+
+This is impossible with stdin-piped MCP shells, where the AI must somehow supply the secret. Interactive build pipelines that involve code-signing keys, hardware token PINs, or two-factor codes work naturally on ripple — the human stays in the loop only for the moment that requires them, and the AI handles everything around it.
 
 ### PowerShell becomes a first-class AI environment
 
@@ -70,12 +74,6 @@ PowerShell on ripple is the difference between **"AI can answer one-off question
 
 ripple opens a **real, visible terminal window**. You see every AI command as it runs — same characters, same output, same prompt — and you can type into the same window yourself at any time. When a command hangs on an interactive prompt, stalls in watch mode, or just needs a Ctrl+C, the AI can read what's currently on the screen and send keystrokes (Enter, y/n, arrow keys, Ctrl+C) back to the running command — diagnosing and responding without human intervention.
 
-### Sensitive operations stay sensitive
-
-When a command needs a passphrase, MFA code, or other secret — `Read-Host -AsSecureString`, `gpg --sign`, `ssh-add`, `sudo`, cloud CLI MFA prompts — you type it directly into the visible window. The keystrokes go to the running program, not to the terminal output stream the AI sees. The AI orchestrates the workflow ("run the publish build, sign with my key, then push the tag") but never sees the secret itself.
-
-This is impossible with stdin-piped MCP shells, where the AI must somehow supply the secret. Interactive build pipelines that involve code-signing keys, hardware token PINs, or two-factor codes work naturally on ripple — the human stays in the loop only for the moment that requires them, and the AI handles everything around it.
-
 ## Tools
 
 ### Shell tools
@@ -99,19 +97,32 @@ Status lines include the console name, shell family, exit code, duration, and cu
 
 Claude Code–compatible file primitives (`read_file`, `write_file`, `edit_file`, `search_files`, `find_files`), useful when the MCP client doesn't already provide them.
 
-## REPL support
+## Adapters
 
-On top of the four shells (pwsh/powershell, bash, zsh, cmd), ripple ships adapters for twelve REPLs — **python**, **node**, **racket**, **ccl** / **abcl** / **sbcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), **groovysh** (Apache Groovy Shell), **sqlite3**, **lua**, and **deno** — and for three debuggers — **perldb** (Perl's `perl -d`), **jdb** (Java Debugger), and **pdb** (Python debugger). Start any of them with `start_console shell=python` (or `node`, `sqlite3`, `perldb`, etc.), and the same OSC 633 command-lifecycle tracking, session persistence, cache-on-timeout, and auto-routing that the shell adapters get applies unchanged.
+ripple ships **19 adapters** — 4 shells, 12 language REPLs, 3 debuggers — all defined declaratively in YAML and driven by a shared worker runtime. Start any of them with `start_console shell=<name>`, and the same OSC 633 command-lifecycle tracking, session persistence, cache-on-timeout, and auto-routing apply unchanged.
 
-Debugger adapters are a new `family: debugger` class: they expose the regular session contract *plus* a structured `commands.debugger` vocabulary (step_in / step_over / step_out / continue / print / dump / backtrace / source_list / locals / breakpoint_set / ...) so AI agents can drive any debugger using the same operation names, regardless of whether the underlying syntax is `s` (perldb), `step` (jdb), or `s` (pdb).
+**Shells (4)** — pwsh / powershell, bash, zsh, cmd
 
-All nineteen adapters are defined by declarative YAML files in `adapters/` and driven by a shared worker runtime — see [adapters/SCHEMA.md](adapters/SCHEMA.md) for the framework. External adapters can be dropped into `~/.ripple/adapters/*.yaml`, but the schema is still iterating toward a v1 freeze, so for now upstreaming additions is the safer path than carrying local YAMLs.
+**REPLs (12)**
+- **Languages**: Python, Node.js, Deno (TypeScript), Lua
+- **Lisp**: Racket, CCL / ABCL / SBCL (Common Lisp)
+- **JVM**: jshell (Java), groovysh (Apache Groovy)
+- **Other**: F# Interactive (fsi), SQLite3
+
+**Debuggers (3)** — pdb (Python), perldb (Perl `perl -d`), jdb (Java) — driven via a unified `commands.debugger` vocabulary (step_in / step_over / step_out / continue / print / dump / backtrace / source_list / locals / breakpoint_set / ...) so AI agents drive any debugger with the same operation names, regardless of whether the underlying syntax is `s`, `step`, or otherwise.
+
+Adapter framework: see [adapters/SCHEMA.md](adapters/SCHEMA.md). Custom adapters can be dropped into `~/.ripple/adapters/*.yaml`, but the schema is still iterating toward a v1 freeze, so upstreaming additions is the safer path for now.
 
 ## Multi-shell behavior
 
 Each console tracks its own cwd. When the active console is busy, the AI is auto-routed to a sibling console of the same shell family — started at the source console's cwd — and its next command runs immediately. Manual `cd` in the terminal is detected and the AI is warned before it runs the wrong command in the wrong place.
 
-Other niceties: **console re-claim** — consoles outlive their parent MCP process, so AI client restarts don't kill your loaded modules and variables. **Multi-line PowerShell** — heredocs, foreach, try/catch, and nested scriptblocks all work. **Sub-agent isolation** — parallel AI agents each get their own consoles so they don't clobber each other's shells.
+### Reliability features
+
+- **Console re-claim**: consoles outlive their parent MCP process — AI client restarts don't kill loaded modules or variables
+- **Cwd drift detection**: a manual `cd` in the terminal triggers a verification warning before the AI runs in the wrong place
+- **Sub-agent isolation**: parallel AI agents get their own consoles, no cross-contamination
+- **Multi-line PowerShell**: heredocs, `foreach`, `try`/`catch`, nested scriptblocks all work via tempfile dot-sourcing
 
 <details>
 <summary>Full routing matrix</summary>
@@ -168,7 +179,7 @@ graph TB
 
 </details>
 
-### Build from source
+## Build from source
 
 ```bash
 git clone https://github.com/yotsuda/ripple.git
@@ -206,6 +217,10 @@ against the real interpreter.
 - **cmd.exe exit codes always read as 0** — cmd's `PROMPT` can't expand `%ERRORLEVEL%` at display time, so AI commands show as `Finished (exit code unavailable)`. Use `pwsh` or `bash` for exit-code-aware work.
 - **Don't `Remove-Module PSReadLine -Force` inside a pwsh session** — PSReadLine's background reader threads survive module unload and steal console input, hanging the next AI command. Not recoverable.
 - **Linux / macOS: interactive rendering after AI commands can drift.** On Unix there's no in-process virtual terminal emulator between ripple and the hosted shell — the relay is byte-level. DSR cursor-position replies are fabricated from the adapter's known prompt shape, which is accurate enough that shells accept typed input and AI commands capture output correctly (matrix passes for bash / pwsh / python) but not precise enough to keep PSReadLine's history recall or bash readline's prompt redraw fully aligned with the physical cursor after large outputs. A full VT emulator layer is tracked as future work.
+
+## Migration
+
+Renamed from `splash` at v0.8.0. The project shipped as `splashshell` on npm for v0.1.0–v0.5.0, was renamed to `@ytsuda/splash` for v0.7.0, and renamed again to `@ytsuda/ripple` starting with v0.8.0 once the adapter framework grew past shells into any REPL. `@ytsuda/splash` and `splashshell` are both deprecated; uninstall them and install `@ytsuda/ripple` to keep receiving updates. The GitHub repo moved from `yotsuda/splash` to `yotsuda/ripple`; GitHub redirects old clone URLs automatically.
 
 ## License
 

@@ -1,7 +1,7 @@
 {
   "name": "@ytsuda/ripple",
-  "version": "0.12.0",
-  "description": "REPL-sharing MCP server — AI and human work in the same live terminal. 18 embedded adapters: shells (bash, pwsh, zsh, cmd), REPLs (python, node, fsi, jshell, groovysh, racket, ccl, abcl, lua, deno, sqlite3), and debuggers (perldb, jdb, pdb). Real-time command visibility, session persistence, multi-console routing.",
+  "version": "0.13.0",
+  "description": "REPL-sharing MCP server — AI and humans co-drive the same visible terminal. 19 embedded adapters: shells (bash, pwsh, zsh, cmd), language REPLs (Python, Node, Deno, Lua, Racket, CCL/ABCL/SBCL Common Lisp, F# Interactive, jshell, Groovy, SQLite3), and debuggers (pdb, perldb, jdb). Session persists across tool calls; secrets typed in the visible window stay out of AI's view.",
   "license": "MIT",
   "author": "Yoshifumi Tsuda",
   "repository": {
@@ -13,28 +13,42 @@
     "mcp",
     "mcp-server",
     "model-context-protocol",
-    "repl",
+    "claude",
+    "claude-code",
+    "anthropic",
+    "ai-agent",
+    "ai-shell",
+    "co-driving",
+    "shared-terminal",
+    "visible-terminal",
+    "shared-console",
     "shell",
+    "terminal",
+    "repl",
+    "debugger",
+    "pty",
+    "conpty",
     "bash",
     "pwsh",
     "powershell",
+    "zsh",
     "cmd",
     "python",
     "node",
-    "debugger",
-    "terminal",
-    "conpty",
-    "shared-console",
-    "claude",
-    "ai"
+    "deno",
+    "racket",
+    "common-lisp",
+    "groovy",
+    "fsharp",
+    "sqlite"
   ],
   "bin": {
     "ripple": "bin/cli.mjs"
   },
   "optionalDependencies": {
-    "@ytsuda/ripple-win32-x64": "0.12.0",
-    "@ytsuda/ripple-linux-x64": "0.12.0",
-    "@ytsuda/ripple-darwin-arm64": "0.12.0"
+    "@ytsuda/ripple-win32-x64": "0.13.0",
+    "@ytsuda/ripple-linux-x64": "0.13.0",
+    "@ytsuda/ripple-darwin-arm64": "0.13.0"
   },
   "files": [
     "bin/",

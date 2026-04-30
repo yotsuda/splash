@@ -8,14 +8,14 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>ripple</AssemblyName>
     <RootNamespace>Ripple</RootNamespace>
-    <Version>0.12.0</Version>
+    <Version>0.13.0</Version>
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>
     <Authors>Yoshifumi Tsuda</Authors>
     <Company>Yoshifumi Tsuda</Company>
     <Product>Ripple</Product>
-    <Description>Universal MCP server that exposes any shell (bash, pwsh, cmd) over ConPTY</Description>
+    <Description>REPL-sharing MCP server for AI co-driving — shells (bash, pwsh, cmd, zsh), language REPLs, and debuggers over ConPTY</Description>
     <Copyright>Copyright (c) 2026 Yoshifumi Tsuda</Copyright>
   </PropertyGroup>
 

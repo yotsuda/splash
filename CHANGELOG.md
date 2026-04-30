@@ -4,498 +4,336 @@ All notable changes to ripple are documented here. Format based on [Keep a Chang
 
 ## [Unreleased]
 
-## [0.12.0] - 2026-04-23
+## [0.13.0] - 2026-04-30
 
-Two themes drive this release. **(1) pwsh output fidelity** — `encoded_scriptblock` multi-line delivery (faster than tempfile, no disk I/O, same dot-source scope semantics) is now the default, unlocked by a fix to the VT interpreter feed that had the baseline grid drifting one chunk past the OSC C boundary. Non-terminating errors now surface as `⚠ Completed with errors` + `Errors: N` on the status line so `Write-Error` / cmdlet failures can't hide behind a green `✓` just because the process exited 0. Stale `$LASTEXITCODE` no longer leaks from a preceding native-exe pipeline into the next pure-PS pipeline's reported exit code. **(2) Output rendering hardening at the MCP boundary** — OSC 8 hyperlinks are preserved as `<URI>` cells instead of dropped, dangling SGR on either side of the output block is cleaned up (leading no-op reset stripped, trailing reset added when output ends mid-colour), stale SGR no longer bleeds onto cells that are overwritten with different characters, and `ripple-exec` tempfile paths are stripped from PowerShell `ConciseView` error summaries so ripple's implementation detail stops leaking into AI error traces.
+**Structured PowerShell error visibility.** AI can now read PowerShell errors as typed fields instead of parsing SGR-coloured text. Three new OSC 633 extensions surface error messages, truncation count, and silent native exit codes; an opt-in `strip_ansi` flag drops SGR bytes when callers don't need them.
 
-Separately: a new `list_shells` MCP tool replaces startup stderr noise with a queryable discovery endpoint (startup stderr is now two-tier — silent modes only surface user-actionable load issues); AI-initiated `cd` is no longer misattributed as user drift (replaced the cwd-snapshot heuristic with a provenance counter); PTY width tracks the visible ConHost width instead of flooring at 200 so `\r`-based self-repainting `Write-Progress` bars work; a safety-net try/finally guarantees `HandleExecuteAsync` releases the user-input hold gate on every exception path.
-
-### Acknowledgments
-
-- @doraemonkeys — PR #7 (`\xNN` → `\uNNNN` in `send_input` docs) and PR #8 (surface `send_input` in the busy-timeout hint). Both landed as in-repo doc fixes that close discoverability gaps the AI consumer would otherwise hit exactly when it needed to rescue a stuck console.
+**Refuse and rescue paths show what the AI needs.** First-execute refuse messages include Live cwd and Resolved shell so the AI can confirm the target before re-sending. Busy-timeout hint reordered to peek → send → wait. CLI gains `--version` / `--help`. PAGER / GIT_PAGER / MANPAGER pinned so external CLIs don't freeze the console waiting for `q`.
 
 ### Added
 
-- **`Errors: N` counter on the status line for PowerShell commands.** PowerShell maintains an automatic per-runspace `$Error` ArrayList that accumulates every cmdlet non-terminating error, `Write-Error` invocation, and thrown exception. `ShellIntegration/integration.ps1` snapshots `$Error.Count` at `PreCommandLookupAction` and emits the post-command delta as a new OSC 633;E;{N} marker; the worker carries the value through `CompletedCommandSnapshot.ErrorCount`, the proxy reads it from the response, and `FormatStatusLine` (and `BuildStatusLine` for cached drains) prepend `| Errors: N` when N > 0. Zero is silent so the happy path keeps the existing line shape. Other shells emit no OSC E and stay at zero — no analogous always-on counter exists for `Write-Warning` / `Write-Information` (cmdlets bypass any user-defined proxy via `$PSCmdlet.WriteWarning`, so they can't be reliably counted from inside the integration script), so warnings and info are intentionally not tracked. Three regression asserts in `OscParserTests` cover OSC E parsing (positive count, zero, malformed payload defaults to 0).
+- **Structured error messages from PowerShell.** OSC 633;R surfaces each `$Error` entry as a separate field, base64-utf8 encoded. Proxy renders an `--- errors (N of total) ---` section after the main output, with cmdlet provenance prefixes (`Get-Item: ...`). Caps at 20 records, oldest first (root causes are usually the first errors, later cascades drop on overflow). Each message capped at 1000 chars.
 
-- **OSC 8 hyperlinks preserved as `<URI>` in the MCP response.** Modern terminals (xterm, Windows Terminal, iTerm2, VS Code) accept `\e]8;;<URI>\a link-text \e]8;;\a` to make link-text clickable. Build tools (`dotnet`, some linters), `Write-Information`, and IDE integrations emit these around file paths and documentation URLs. Previously ripple dropped them with every other OSC, losing the destination — the AI saw only the link-text and couldn't reference the URI back to the user. Now `CommandOutputRenderer` detects OSC 8 (open and close variants, both BEL- and ST-terminated) and injects the captured URI into the grid as `<URI>` cells right after the link-text, e.g. `"click here<https://example.com/>"`. All other OSCs still drop silently. Six asserts added to `CommandOutputFinalizerTests` covering BEL/ST terminators, params segment (`id=foo` between the semicolons), unclosed opens, stray closes, and mix with surrounding OSC 0/7 traffic.
+- **Truncation count as its own field.** OSC 633;T reports how many error records were dropped, separate from the R event stream. Header reads `--- errors (20 of 25) ---` matching the status badge `Errors: 25`. Under-cap cases keep the bare `(N)` header.
 
-- **MCP tool hint when large output spills to disk.** When a command's output exceeds the 15 KB threshold and gets written to a spill file, the preview now surfaces ripple's own `search_files` / `read_file` MCP tools as the recommended way to drill into the spill file — instead of leaving the AI to reach for shell `grep` / `cat` (which round-trips through the same PTY the command just ran in). The hint uses bare tool names so it stays valid no matter which MCP client prefix wraps ripple (`ripple` / `ripple-stable` / `ripple-dev` all resolve via the client's tool list).
+- **Native non-zero exit code surfaced when pipeline succeeds.** OSC 633;L emits `LastExit: N` on the status line for `cmd /c exit 7; "after"`-style pipelines where `$?` is True but a native exe exited non-zero. The green ✓ badge no longer hides silent native failures.
 
-- **`encoded_scriptblock` multi-line delivery mode for the pwsh adapter.** New `multiline_delivery` schema value. Base64-encodes the multi-line body and sends a single-line `. ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(<b64>))))` invocation. Dot-sourcing preserves caller scope the same as the tempfile path but avoids disk I/O and history-filter bookkeeping entirely. Shares the body builder (`BuildMultiLineTempfileBody`) with the tempfile path so both deliveries produce identical echo + OSC-C semantics — only the delivery wrapper differs. Roughly 0.3–0.5s faster than tempfile on the warm path for the common multi-line case.
+- **`strip_ansi` flag on `execute_command` / `wait_for_completion`.** Default `false`. When `true`, response output runs through a narrow SGR-only regex (`\x1b\[[0-9;]*m`) — saves tokens for callers that don't reference colour cues. Visible console output is never touched.
 
-- **`⚠ Completed with errors` status badge.** Post-command status splits into three outcomes instead of two: `exit != 0` → `✗ Failed`, `exit == 0, errors > 0` → `⚠ Completed with errors`, `exit == 0, errors == 0` → `✓ Completed`. pwsh commands that hit a `Write-Error` or non-terminating cmdlet failure exit 0 but bump `$Error` — a plain green ✓ understated what the AI needed to look at. The ⚠ badge pairs with the existing `Errors: N` tag so one status line carries both outcome category and error count without a second round trip. Applied consistently at both the Tools surface and `ConsoleWorker`'s own rendering so the two sites can't drift.
+- **First-execute refuse shows Live cwd and Resolved shell.** AI can confirm the target without an extra `pwd` round-trip. Sub-agent isolation boundaries probe the target console's cwd directly so the line is never blank.
 
-- **`list_shells` MCP tool.** Discovery endpoint for what values the current ripple build accepts as the `shell` argument to `execute_command` / `start_console`. Returns a JSON object with a `shells` array — one entry per registered adapter carrying name, aliases, description, family (`shell` / `repl` / `debugger`), source (`embedded` / `external`), and the executable `start_console` would actually launch (or `null` + `executable_note` when the name / override is not on PATH). The tool description also documents that any absolute path can be passed as `shell` to launch an unregistered REPL — with the caveat that without a matching adapter ripple runs it in a minimal mode (no prompt-boundary detection, no exit code, no cwd tracking), so a YAML in `~/.ripple/adapters/` is the right move for anything used regularly. A `load_issues` object on the response carries every parse error / collision / override detected at startup with a `user_actionable` flag.
+- **CLI: `--version`, `--help`, unknown-arg rejection.** No more silent hangs in MCP server mode when a flag is mistyped. `--version` carries the git commit hash via `SourceRevisionId`.
+
+- **Pager suppression in every console.** `PAGER` / `GIT_PAGER` / `MANPAGER=cat` injected at `PtyFactory.Start`. `git log` (~8700 lines) returns in 243 ms instead of waiting on `q`.
 
 ### Changed
 
-- **Startup stderr goes two-tier.** CLI modes (`--test`, `--list-adapters`, `--adapter-tests`, etc.) still print the full `[ripple adapters info]` / `WARNING` summary — a human is reading the terminal. Silent modes (MCP stdio server, ConPTY worker via `--console`) now suppress the info-level roll-up entirely and print only the subset of issues a user can act on: parse errors and collisions involving an external YAML the user dropped in `~/.ripple/adapters/`. Embedded-only failures are ripple bugs the user can't fix, and firing them at every prompt was noise without a path to resolution. AI consumers needing the full picture call `list_shells`. Supporting helpers on the registry: `AdapterLoader.ParseError` is now a record carrying `Embedded` / `External` source; `AdapterRegistry.LoadReport` gains `Collision` (with `IsUserActionable`), `HasUserActionableIssues`, and `UserActionableSummary`; the load report is persisted alongside `Default` via `SetDefault(registry, report)` so `list_shells` surfaces startup issues without re-running the load. `--list-adapters` output is updated for the typed report (parse errors show `[source]` prefix, collisions show `(user-actionable)` suffix).
+- **Busy-timeout hint reordered: peek → send → wait.** Matches the order an AI should reach for the rescue tools when a command looks stuck. `peek_console` was previously missing from the hint entirely.
 
-- **pwsh multi-line delivery default flipped to `encoded_scriptblock`.** Now that the baseline-bleed race that previously tripped encoded delivery is fixed upstream (see the OSC-aligned `_vtState` feed under Fixed), `adapters/pwsh.yaml` defaults to `encoded_scriptblock`. 20+ consecutive burn-in runs of the original bleed repro (`if ($true) { "a"; "b"; 1..3 | ForEach-Object { "iter $_" } }`) produce clean output on the new default. `tempfile` remains selectable for bodies whose decoded length would exceed PSReadLine's input line cap.
+- **GHA actions on actually-Node-24 runtimes.** `upload-artifact@v5` / `download-artifact@v5` carried preliminary Node 24 but defaulted to Node 20; the default moved to Node 24 in v6+. `azure/login@v2 → v3` (also Node 20 → 24).
 
-- **`execute_command` busy-timeout hint now mentions `send_input`.** When a command times out, the response header previously pointed only at `wait_for_completion`, which never returns when the command is actually stuck on an interactive prompt (pager, `Read-Host`, y/n confirmation). The hint now surfaces `send_input` as a peer tool with a role label (`wait_for_completion (retrieve result), send_input (if stuck on interactive prompt / pager)`) so the rescue path is discoverable at the moment it's needed. Contributed by @doraemonkeys in PR #8.
+- **README and npm metadata refreshed.** README leads with descriptor `# Ripple — REPL-sharing MCP for AI Co-Driving`. "Why ripple?" promotes Sensitive operations as the lead sub-section (the most novel differentiator). 19-adapter list bullet-formatted by family. Rename history moved to `## Migration` near the bottom. npm `description` rewritten to lead with co-driving + secret-safety; adapter count corrected (18 → 19, sbcl was missing); keywords expanded 17 → 31 to cover discovery vectors.
 
-- **`send_input` documentation recommends JSON-native `\uNNNN` escapes.** Both the tool and `input` parameter `[Description]` strings previously advised C-style `\xNN` hex escapes (e.g. `\x03` for Ctrl+C, `\x1b[A` for arrow-up). JSON does not accept `\xNN`, so strict parsers rejected callers and lenient parsers passed through four literal characters — either way the advertised "send Ctrl+C" behavior did not reach the PTY, and agents following the docs verbatim got stuck rescuing pager-blocked consoles. The docs now recommend `\u0003` / `\u001b[A` and include an explicit note that JSON does not accept `\xNN`. Runtime behavior is unchanged: `ConsoleWorker.UnescapeInput` still recognises the old `\xNN` form and is covered by existing tests; the new `\uNNNN` form is decoded by the JSON layer into real control bytes and passes through `UnescapeInput` untouched. Contributed by @doraemonkeys in PR #7.
-
-- **GHA workflow actions bumped to v5.** `actions/{checkout,setup-dotnet,setup-node,upload-artifact,download-artifact}` move from `@v4` to `@v5` ahead of GitHub's forced Node.js 24 switch on 2026-06-02 and Node 20 removal on 2026-09-16. No API changes needed. `azure/login@v2` is already on Node 24 and stays.
+- **`list_shells` documented in README** and tool descriptions in `AdapterTools.cs` / `ShellTools.cs` synced with the actual shipping set.
 
 ### Fixed
 
-- **Dangling SGR at output boundaries is now cleaned up.** Two symmetric boundary cases previously leaked visible noise or bled colour into consumer state: (a) a LEADING `\e[m` / `\e[0m` reset that serves no purpose at the MCP boundary (the consumer hasn't applied any SGR yet), e.g. Write-Progress cleanup dropping a reset at the bar's column which then attached as the SgrPrefix of the first non-bar character and showed up as `[mafter` garbage; (b) a MISSING trailing reset when the output ends mid-colour — observed when `Write-Error` or a coloured diagnostic's final byte is the message text, with no `\e[0m` to close, leaving the consumer's next prompt stuck red. `CommandOutputFinalizer.CleanString` now strips leading reset-only SGR sequences AND appends `\e[0m` when the cumulative SGR state at end-of-output is non-default (determined by scanning the last SGR sequence: parameters empty or all-zero = reset, anything else = setter). Eight regression asserts in `CommandOutputFinalizerTests` cover single / chained leading resets, preserved leading setters, missing / existing / bare-form trailing resets, plain text with no SGR, and the combined case.
+- **DECAWM duplicate-char wrap continuation.** ConPTY re-emits the wrapping char on auto-margin, so on long lines (~100+ chars, e.g. git CRLF warnings) the continuation's first byte duplicated the prefix's last — visible as `CRLLF the next time...`. The cursor redirect now lands at `_lastLfPreCol - 1` so the duplicate overwrites itself harmlessly. See `HANDOFF_GARBLING.md` for the dogfood report.
 
-- **Tempfile path no longer leaks into multi-line AI command error output.** Multi-line AI commands are wrapped into a `.ripple-exec-<pid>-<guid>.ps1` (or `.cmd` / `.sh`) file and dot-sourced, which is invisible for the happy path but PowerShell's `ConciseView` error renderer prefixes the summary with `{Cmdlet}: {TempfilePath}:{Line}`, exposing ripple's implementation detail. AI consumers had no way to know that path was a wrapper they didn't write — it just looked like an unrelated file in their error trace. `CommandOutputFinalizer.CleanString` now strips any line containing a `ripple-exec-<pid>-<hex>.{ps1,cmd,sh}` reference (Windows or POSIX flavor); the `Line | N | <source>` block below — which carries the actual diagnostic — is preserved untouched. Single-line AI commands never wrap, so they never produced this leakage and stay unaffected. Five regression asserts in `CommandOutputFinalizerTests` cover pwsh ConciseView output, bash on POSIX, cmd.exe `.cmd` paths, mid-line occurrences, and a negative case verifying that unrelated `.ps1` paths are untouched.
+- **Drift detection switched to direct cwd comparison.** The previous OSC-C-event-counter heuristic miscounted under wrapped scripts, command composition, and during AI command execution. Now asks the actual question: does the current cwd match what the AI thinks it should be? `_userCmdsSinceLastAi` and its `get_status` field are removed.
 
-- **Stale SGR no longer bleeds into text that overwrites previous cells.** `CommandOutputRenderer.WriteChar` used `prefix ?? existing.SgrPrefix` on every cell overwrite, which inherited the old cell's SGR prefix whenever no new SGR was pending. That's correct for ConPTY repaint idempotence (same char redrawn should keep its color), but wrong for genuine content changes: PowerShell's `Write-Progress` Minimal view leaves reverse-video `\e[7m` cells on the row it used for the bar, and the cleanup path doesn't reset the SGR attribute on those cells before normal text later writes over them. Observed: `Write-Progress ... ; "after"` produced `[mafter [7mprogress` (garbled — reverse video leaked into random words). Fixed by splitting the overwrite decision: (a) new SGR pending → use it; (b) same char, no new SGR → keep existing (repaint); (c) different char, no new SGR → drop existing SGR — the previous character and its SGR belonged together. Three regression asserts added to `CommandOutputFinalizerTests`: overwrite-diff drops stale SGR, repaint-same-char preserves it, partial overwrite drops on touched cells while leaving the tail untouched.
+### Internal
 
-- **Stale `$LASTEXITCODE` no longer bleeds into subsequent pure-PowerShell pipelines.** `ShellIntegration/integration.ps1`'s prompt fn previously read `$global:LASTEXITCODE` verbatim as the OSC D exit code. `$LASTEXITCODE` is only updated by native executables, so after e.g. `cmd /c "exit 7"` the value stayed at 7 and every subsequent innocent PS pipeline (`1..3 | ForEach-Object {...}`, `Get-Date`) was reported as `Failed (exit 7)`. Fixed by: (1) capturing `$?` as the first statement of the prompt fn — it's PowerShell's canonical pipeline-success indicator and is updated by cmdlets, natives, and statements alike; (2) snapshotting `$LASTEXITCODE` at `PreCommandLookupAction` so the prompt fn can tell whether the value was updated BY this pipeline or inherited; (3) resolving the exit code in priority order: `$?` true → 0; `$?` false and `$LASTEXITCODE` changed non-zero → use it; `$?` false otherwise → generic failure 1. Multi-line AI pipelines (run via `. 'tempfile.ps1'; Remove-Item '...'`) would otherwise see `$?` reflect Remove-Item, so `BuildMultiLineTempfileBody` now stashes `$?` and `$LASTEXITCODE` into globals inside the tempfile's scope that the prompt fn reads with priority. Two regression tests added to `adapters/pwsh.yaml`: `cmdlet_error_surfaces_exit_1` (cmdlet error → exit 1, not stale 0) and `lastexitcode_does_not_leak_after_native` (setup native exit 7, eval pure PS → must be exit 0).
+- **`ShellPathResolver` extracted** to fix a layer-violating reverse dependency from `Adapter` (data model) into `ConsoleManager` (runtime). PATH resolution now lives in its own utility.
+- **`StatusLineFormatter` consolidates two near-identical implementations** (`ConsoleWorker.BuildStatusLine` + `ShellTools.FormatStatusLine`). Status-line extensions now have one source of truth instead of two sites that had to be updated in lockstep.
+- **OSC 633 extension field (de)serialization centralized** in `WriteOscExtensionFields` / `ReadOscExtensionFields`. Adding the next extension is one line per call site instead of four.
+- **pwsh exit-code resolution centralized** in `__rp_resolve_exit_code`. OSC D and OSC L can no longer disagree on pipeline success.
+- **`AssertOscExt` test helper.** OSC R / T payload tests collapsed: 90 lines removed, 19 added, same coverage.
+- Inline comments on two intentionally-bare catches in `ConsoleWorker` (no behavior change).
+- `docs/ARCHITECTURE.md` Cache / drain row corrected (file attributions and stale symbol name).
+- `.gitignore` adds `.stash-next-release/` for work-in-progress adapters parked between releases.
 
-- **AI's own `cd` is no longer misattributed as a user-initiated drift.** Drift detection previously compared the source console's `LastAiCwd` against the current `OSC 633;P;Cwd=` snapshot; if the two diverged for any reason — including internal state lag such as standby-rotation ordering or a race between `RecordShellCwd` and the next `get_status` — the proxy concluded the human had moved the shell and emitted a spurious `source #N was moved by user to '...'; ran in #M at your last known cwd '...'` routing notice while silently reverting the AI to a stale cwd. Replaced with a provenance counter (`CommandTracker.UserCmdsSinceLastAi`) that increments exactly once per user-typed command at OSC A (closing a user-busy cycle) and resets to 0 on every `RegisterCommand`. The worker now exposes the counter as a `userCmdsSinceLastAi` field on `get_status`, and `ConsoleManager.PlanExecutionAsync` reads it instead of comparing cwd snapshots. AI-initiated cd → counter stays 0 → no drift; user-initiated command (cd or otherwise) → counter increments → drift handled correctly. Removes the old `IsCwdDrifted` helper and its unit tests; adds 13 new provenance-counter asserts to `CommandTrackerTests` covering pwsh (B→C→D→A), bash/zsh (C→D→A), bare-OSC-A repeats, startup-OSC-B gating, and the interleaved AI-cd / user-cmd / AI-cmd scenario that reproduces the original bug in unit form.
+## [0.12.0] - 2026-04-23
 
-- **Explicit LineFeed clears a stale soft-wrap flag on baseline rows.** An explicit LineFeed means the destination row is a new logical line, not a soft-wrap continuation. Baseline rows that were wrap continuations of pre-command content (e.g. a long input echo that has since been erased) previously kept their `ContinuedFromAbove` flag, causing the render-time join logic to chain command-emitted rows onto predecessors and produce collapsed output like `abiter 1\niter 2` instead of `a\nb\niter 1\niter 2`. Clearing the flag when LineFeed targets a row within the baseline range lets each command-written line stand on its own at render time.
+**pwsh output fidelity.** PowerShell error visibility upgraded across the board: cmdlet failures show on the status line as `⚠ Completed with errors | Errors: N` instead of hiding behind a green ✓ on exit 0. Multi-line bodies now ship as base64-encoded scriptblock by default — faster than tempfile, no disk I/O, same dot-source scope semantics. Stale `$LASTEXITCODE` from a preceding native pipeline no longer leaks into the next pure-PS command's reported exit.
 
-- **PTY width tracks the visible console width instead of flooring at 200.** The old floor-at-200 policy was meant to dodge mid-word soft-wraps in AI output but broke self-repainting lines. pwsh's `Write-Progress` pads its bar to the declared PTY width; when that exceeded the visible ConHost width the bar wrapped physically and the trailing `\r` returned only to the wrapped row, leaving each progress update stacked vertically instead of overwriting in place. Matching the visible width makes `\r`-based in-place repainting behave correctly. Mid-word splits on very narrow terminals remain a theoretical edge case the AI can still read around (and they match what the user is looking at anyway). Same change in the spawn-time path and in `ResizeMonitorLoop` — they stayed in sync with the old policy and stay in sync with the new one.
+**Output rendering hardened at the MCP boundary.** OSC 8 hyperlinks preserved as `<URI>` cells instead of dropped. Dangling SGR at output edges cleaned up (leading no-op reset stripped, trailing reset added when output ends mid-colour). Stale SGR no longer bleeds into cells overwritten with different characters. `ripple-exec-<pid>-<guid>.ps1` tempfile paths stripped from PowerShell `ConciseView` error summaries.
 
-- **`_vtState` fed in OSC-aligned slices so baseline reflects the OSC C boundary.** `ConsoleWorker.ReadOutputLoop` used to advance the live VT interpreter with an entire PTY chunk before the OSC event loop ran, so the snapshot handed to `CommandOutputRenderer` at `CommandExecuted` reflected end-of-chunk state rather than the screen at the OSC C byte. When a single PTY read straddled OSC C and downstream command-output bytes — the common case on `encoded_scriptblock` multi-line delivery — the baseline grid carried cells from the command output the renderer was about to replay and the cursor landed past the row the AI expected first output to reach. The renderer then wrote `"a"` onto a row whose stale tail was `"ter 3"`, producing `"ater 3"` (or dropped the line entirely when the cursor ended up on an already-written row). Feed the VT interpreter in slices aligned to OSC event offsets instead. Snapshot at `CommandExecuted` now reflects state as of the OSC C byte exactly. Cleaned text (OSC 633 stripped) is equivalent to raw for VT interpretation — OSC is dropped by `ApplyOsc`, DSR queries are stripped upstream — so no state semantics change. `CommandOutputRendererTests` now documents the renderer's baseline sensitivity and the slice-by-offset happy-path assertion.
+Plus: a queryable `list_shells` MCP tool, two-tier startup stderr (silent modes only surface user-actionable load issues), AI-initiated `cd` no longer misattributed as user drift, PTY width tracks the visible ConHost width so `\r`-based progress bars repaint in place, and a try/finally safety net guarantees `HandleExecuteAsync` releases the user-input hold gate on every exception path.
 
-- **`_holdUserInput` gate and `_heldUserInput` queue are now guaranteed to release on every exit path.** The hold-gate + queue mechanism (held user keystrokes replay after the AI command finishes so partial typed input isn't lost) previously leaked on any unhandled exception path — `WriteToPty` failures, `Task.WhenAny` surfacing an unexpected exception type, `snapshotTaskLocal` throwing non-`TimeoutException` / non-`InvalidOperationException`. The flag would stay true, user keystrokes kept piling into a queue nobody would drain, and the next `execute_command` would start with an already-poisoned shell. `HandleExecuteAsync` now wraps the body from `_holdUserInput = true` onwards in try/finally and calls `ReleaseHeldUserInput()` from the finally. Explicit releases on the happy path, timeout branch, and finalize-failed branch are preserved so the shell still gets the "head start" semantics (release before JSON serialization, keystrokes replay while the proxy formats the response). `ReleaseHeldUserInput` is idempotent (flag assignment + `TryDequeue` loop empty-exit + flush `try/catch`) so the duplicate call on normal paths is a no-op.
+### Acknowledgments
+
+- @doraemonkeys — PR #7 (JSON-native escape recommendations in `send_input` docs) and PR #8 (surface `send_input` in busy-timeout hint).
+
+### Added
+
+- **`Errors: N` on the status line for PowerShell.** OSC 633;E carries `$Error.Count` delta from the integration script; status line prepends `| Errors: N` when N > 0. Other shells emit no E and stay at zero. `Write-Warning` / `Write-Information` are not tracked — cmdlets bypass any user proxy via `$PSCmdlet.WriteWarning`, so they can't be reliably counted from an integration script.
+
+- **OSC 8 hyperlinks preserved as `<URI>`.** Build tools (`dotnet`, linters), `Write-Information`, IDE integrations emit `\e]8;;<URI>\a link-text \e]8;;\a`. Previously dropped with every other OSC; now `CommandOutputRenderer` injects the captured URI as `<URI>` cells right after the link-text (`"click here<https://example.com/>"`). Both BEL and ST terminators handled.
+
+- **MCP tool hint when output spills to disk.** When output exceeds the 15 KB threshold the spill-file preview now points at ripple's own `search_files` / `read_file` tools — instead of leaving the AI to reach for shell `grep` / `cat` (which round-trips through the same PTY). Bare tool names so the hint stays valid no matter which client prefix wraps ripple.
+
+- **`encoded_scriptblock` multi-line delivery for pwsh.** Base64-encoded `. ([ScriptBlock]::Create(...))` invocation. Same dot-source scope as the tempfile path but no disk I/O and no history-filter bookkeeping. ~0.3–0.5 s faster on the warm path. Shares `BuildMultiLineTempfileBody` so both deliveries produce identical echo + OSC-C semantics — only the wrapper differs.
+
+- **`⚠ Completed with errors` status badge.** Three outcomes instead of two: `exit != 0` → ✗ Failed, `exit == 0, errors > 0` → ⚠ Completed with errors, `exit == 0, errors == 0` → ✓ Completed. PowerShell commands hitting `Write-Error` or non-terminating cmdlet failures exit 0 but bump `$Error` — the plain green ✓ understated what the AI needed to look at. Pairs with the new `Errors: N` tag.
+
+- **`list_shells` MCP tool.** Discovery endpoint for the valid `shell` argument values. Returns name, aliases, family (`shell` / `repl` / `debugger`), source (`embedded` / `external`), and the resolved executable path `start_console` would launch (or `null` + `executable_note` when not on PATH). Any absolute path can also be passed as `shell` to launch an unregistered REPL — with the caveat that without a matching adapter ripple runs it in minimal mode (no prompt detection / exit code / cwd tracking). A `load_issues` object surfaces every parse error / collision / override at startup with a `user_actionable` flag.
+
+### Changed
+
+- **Startup stderr two-tier.** CLI modes (`--test`, `--list-adapters`, ...) still print full `[ripple adapters info]` summary — a human is reading the terminal. Silent modes (MCP stdio, ConPTY worker) now suppress the info-level roll-up and print only user-actionable issues (parse errors / collisions on YAMLs in `~/.ripple/adapters/`). Embedded-only failures are ripple bugs the user can't fix; firing them every prompt was noise. AI consumers needing the full picture call `list_shells`.
+
+- **pwsh multi-line delivery defaults to `encoded_scriptblock`.** The baseline-bleed race that previously tripped encoded delivery is fixed (see Fixed). 20+ consecutive burn-in runs of the original repro produce clean output. `tempfile` remains selectable for bodies exceeding PSReadLine's input line cap.
+
+- **Busy-timeout hint mentions `send_input`.** Previously pointed only at `wait_for_completion`, which never returns when the command is stuck on an interactive prompt (pager, `Read-Host`, y/n). Hint now lists both with role labels. PR #8 by @doraemonkeys.
+
+- **`send_input` docs use JSON-native escapes.** Recommended form is now `\u0003` / `\u001b[A` instead of `\x03` / `\x1b[A`. JSON does not accept `\xNN` — strict parsers rejected the input, lenient ones passed through four literal chars, so the advertised "send Ctrl+C" behavior didn't reach the PTY. Runtime accepts both forms; docs show the JSON-native one. PR #7 by @doraemonkeys.
+
+- **GHA actions bumped to v5** ahead of GitHub's forced Node 24 switch on 2026-06-02 and Node 20 removal on 2026-09-16.
+
+### Fixed
+
+- **Dangling SGR at output boundaries.** Two boundary cases: (a) leading `\e[m` reset that attached as the SgrPrefix of the first non-bar character (`Write-Progress` cleanup → `[mafter` garbage); (b) missing trailing reset when output ends mid-colour, leaving the next prompt stuck red. `CleanString` now strips leading reset-only SGR and appends `\e[0m` when end-of-output state is non-default.
+
+- **Tempfile path leakage in multi-line errors.** PowerShell's `ConciseView` prefixed error summaries with `{Cmdlet}: {TempfilePath}:{Line}`, exposing ripple's `.ripple-exec-<pid>-<guid>.ps1` wrapper. Now stripped; the `Line | N | <source>` diagnostic block below is preserved.
+
+- **Stale SGR bleeding into overwriting characters.** `Write-Progress`'s reverse-video bar cells leaked `\e[7m` onto subsequent normal text — `Write-Progress ... ; "after"` produced garbled `[mafter [7mprogress`. `WriteChar` now treats same-char repaint differently from genuine content change: same-char keeps SGR (ConPTY idempotence), different-char drops stale SGR.
+
+- **Stale `$LASTEXITCODE` leaking into pure-PS pipelines.** `$LASTEXITCODE` is only updated by native exes; after `cmd /c "exit 7"` the value stayed 7 and innocent PS pipelines (`Get-Date`) reported `Failed (exit 7)`. Fixed by capturing `$?` first in the prompt fn, snapshotting `$LASTEXITCODE` at `PreCommandLookupAction`, and resolving via priority: `$?` true → 0; `$?` false + LEC changed non-zero → use it; `$?` false otherwise → 1.
+
+- **AI's own `cd` no longer misattributed as user drift.** Cwd-snapshot drift detection produced spurious "moved by user" notices when standby rotation or `RecordShellCwd` race lagged the snapshot. Replaced with a provenance counter (`UserCmdsSinceLastAi`) that increments at OSC A close-of-user-busy and resets on `RegisterCommand`.
+
+- **Explicit LineFeed clears stale soft-wrap flag on baseline rows.** Pre-command rows that were wrap continuations kept their `ContinuedFromAbove` flag, chaining command-emitted lines onto erased predecessors (`abiter 1` instead of `a\nb\niter 1`). Now cleared when LineFeed targets a row in the baseline range.
+
+- **PTY width tracks the visible ConHost width.** Old floor-at-200 broke `Write-Progress` self-repaint — bars padded to the declared width physically wrapped past visible cols, so `\r` returned only to the wrapped row and updates stacked vertically. Matching visible width fixes in-place repainting; mid-word splits on narrow terminals remain a theoretical edge the AI can read around (matches what the user is looking at).
+
+- **`_vtState` fed in OSC-aligned slices.** A single PTY read straddling OSC C and command output had the renderer baseline include cells from the very output it was about to replay (writing `"a"` onto a row whose stale tail was `"ter 3"` produced `"ater 3"`, or dropped the line when the cursor landed on an already-written row). Slice-by-offset feed so the snapshot at `CommandExecuted` reflects state at the OSC C byte exactly. Unblocks `encoded_scriptblock` multi-line as the new default.
+
+- **`HandleExecuteAsync` user-input hold gate guaranteed to release.** Previously leaked on any unhandled exception path — flag stayed true, queued keystrokes never drained, next `execute_command` started with a poisoned shell. try/finally added; release is idempotent so duplicate calls on normal paths are no-ops.
 
 ## [0.11.0] - 2026-04-20
 
-Native binaries for Linux and macOS Apple Silicon ship alongside Windows, distributed as platform-specific npm subpackages. `npm i -g @ytsuda/ripple` now installs from `@ytsuda/ripple-win32-x64`, `@ytsuda/ripple-linux-x64`, or `@ytsuda/ripple-darwin-arm64` automatically via `optionalDependencies`; a small Node launcher (`bin/cli.mjs`) resolves the matching subpackage and spawns its binary with stdio inherited and SIGTERM/SIGINT/SIGHUP/SIGQUIT forwarded. The release workflow is a three-runner matrix build (windows-latest, ubuntu-latest, macos-latest) followed by a single Linux publish job that Authenticode-signs the Windows binary via AzureSignTool, publishes three subpackages + one meta-package with SLSA provenance, and attaches all three binaries to the GitHub Release.
+**Cross-platform shipping.** Native binaries for Linux x64 and macOS arm64 ship alongside Windows. `npm i -g @ytsuda/ripple` resolves the right platform automatically via `optionalDependencies`; a small Node launcher (`bin/cli.mjs`) spawns the matching binary with stdio inherited and SIGTERM / SIGINT / SIGHUP / SIGQUIT forwarded.
+
+The release workflow is now a three-runner build matrix (windows / ubuntu / macos) followed by a single Linux publish job that Authenticode-signs the Windows binary via AzureSignTool, publishes three subpackages + a meta package with SLSA provenance, and attaches all three binaries to the GitHub Release.
 
 ### Added
 
-- **Linux x64 and macOS arm64 native binaries.** NativeAOT-compiled from the same source as the Windows binary via the `build` matrix job; identical `--test` suite gates publish. macOS is Apple Silicon only — GHA's macos-13 (Intel) runner pool capacity made `osx-x64` unshippable.
-- **`@ytsuda/ripple-<platform>` subpackages.** Each carries `os` + `cpu` filters so npm installs only the matching one; the meta package's `optionalDependencies` skip the rest silently.
-- **`npm/bin/cli.mjs` dispatcher.** Resolves `<platform>-<arch>` against an allow-list, `require.resolve`s the subpackage binary, spawns it with `stdio: 'inherit'`, forwards SIGTERM/SIGINT/SIGHUP/SIGQUIT to the child, and re-raises the child's exit signal so `$?` / `%ERRORLEVEL%` / `$status` match a direct invocation.
+- **Linux x64 and macOS arm64 native binaries.** NativeAOT-compiled from the same source as the Windows binary; identical `--test` suite gates publish. macOS Intel (`osx-x64`) deferred — GHA's macos-13 runner pool capacity made it unshippable.
+
+- **`@ytsuda/ripple-<platform>` subpackages.** Each carries `os` + `cpu` filters; npm installs only the matching one and skips the rest silently via `optionalDependencies`.
+
+- **`npm/bin/cli.mjs` dispatcher.** Resolves `<platform>-<arch>` against an allow-list, locates the subpackage binary, spawns with `stdio: 'inherit'`, forwards SIGTERM / SIGINT / SIGHUP / SIGQUIT, and re-raises the child's exit signal so `$?` / `%ERRORLEVEL%` / `$status` match a direct invocation.
 
 ### Changed
 
-- **`.github/workflows/release.yml` is now a two-job matrix build + single-runner publish.** `build` uses `strategy.matrix` over `{win-x64, linux-x64, osx-arm64}` and uploads artifacts; `publish` (Linux, `environment: release`) downloads all three, signs the Windows binary, and publishes subpackages sequentially (win32-x64 → linux-x64 → darwin-arm64) before the meta package so a mid-sequence failure halts before the meta points at a missing subpackage.
-- **`npm/package.json` is now a meta-package.** Ships only `bin/cli.mjs`, README, LICENSE; `optionalDependencies` pin the three subpackages to the exact current version. The `os` restriction on the meta package has been removed — Node can install everywhere, the native binary enforcement is the subpackage filter.
-- **Version cross-check verifies five fields.** csproj `<Version>`, meta `npm/package.json`, and each of the three `npm/platforms/*/package.json` must all equal the pushed tag; the publish job aborts fast if any disagree.
+- **Release workflow split into matrix build + single-runner publish.** `build` runs over `{win-x64, linux-x64, osx-arm64}` and uploads artifacts; `publish` (Linux, `environment: release`) downloads all three, signs the Windows binary, then publishes subpackages sequentially (win32-x64 → linux-x64 → darwin-arm64) before the meta package — a mid-sequence failure halts before the meta points at a missing subpackage.
+
+- **`npm/package.json` is now a meta package.** Ships only `bin/cli.mjs`, README, LICENSE; `optionalDependencies` pin the three subpackages to the exact current version. The `os` restriction is lifted — Node installs everywhere; the native binary requirement is enforced by the subpackage filter.
+
+- **Version cross-check verifies five fields:** csproj `<Version>`, meta `npm/package.json`, and each of the three platform `package.json` must match the pushed tag; publish aborts fast on disagreement.
 
 ## [0.10.0] - 2026-04-20
 
-Three parallel rounds land in the same release. **(1) Live virtual-terminal cursor tracking** — ripple now keeps an authoritative VT-100 interpreter advanced from every PTY chunk and answers DSR (`\x1b[6n`) cursor-position queries from real state instead of the static "near the bottom of the screen" + prompt-heuristic column it shipped with. Closes the long-standing Unix drift where PSReadLine's up-arrow history recall painted over the active prompt, and bash readline wrapped long input lines into the wrong column, after a few AI commands' worth of output had scrolled past. **(2) Oversized command output is spilled to a temp file** (closes #1, PR #5) — outputs over `15,000` chars are written to a worker-owned spill file (`%TEMP%\ripple.output\` on Windows, `${TMPDIR:-/tmp}/ripple.output/` on Unix) and the MCP response returns a head + tail preview embedding the spill path. Inline `execute_command` and deferred `wait_for_completion` now flow through a shared finalize-once boundary so both delivery modes return the same `CommandResult` shape. **(3) Command-output extraction is rebuilt as a per-command fork of the live VT interpreter** (closes #4) — at OSC C the worker snapshots the session-wide `_vtState` and hands the snapshot to a new `CommandOutputRenderer` initialised from it. ConPTY's post-alt-screen and post-prompt redraw bursts target cells whose baseline values match what's being rewritten, so a per-cell change detector recognises them as idempotent overwrites and they stay out of the AI-facing MCP response. Alt-screen entry/exit collapses to an `[interactive screen session]` placeholder; soft-wrapped logical lines are re-joined at render time so a narrow PTY can't fragment a single `git log --oneline` entry.
+Three parallel rounds land in one release.
+
+**(1) Live VT cursor tracking.** ripple now keeps an authoritative VT-100 interpreter advanced from every PTY chunk and answers DSR (`\x1b[6n`) cursor-position queries from real state instead of the static "near the bottom of the screen" heuristic it shipped with. Closes the Unix drift where PSReadLine's up-arrow history recall painted over the active prompt and bash readline wrapped long input into the wrong column after a few AI commands had scrolled by.
+
+**(2) Oversized output spilled to a temp file** (closes #1, PR #5). Outputs over 15,000 chars are written to a worker-owned spill file (`%TEMP%\ripple.output\` on Windows, `${TMPDIR:-/tmp}/ripple.output/` on Unix) and the MCP response returns a head + tail preview embedding the spill path. Inline `execute_command` and deferred `wait_for_completion` flow through a shared finalize-once boundary so both delivery modes return the same `CommandResult` shape.
+
+**(3) Command-output extraction rebuilt as a per-command renderer fork** (closes #4). At OSC C the worker snapshots the session-wide `_vtState` and hands the snapshot to a new `CommandOutputRenderer` initialised from it. ConPTY's post-prompt redraw bursts target cells whose baseline values match what's being rewritten, so a per-cell change detector recognises them as idempotent overwrites and they stay out of the AI-facing response. Alt-screen entry / exit collapses to an `[interactive screen session]` placeholder; soft-wrapped logical lines re-join at render time so a narrow PTY can't fragment a single `git log --oneline` entry.
 
 ### Acknowledgments
 
-- @doraemonkeys — reported the oversized-output overflow as #1 and contributed PR #5 with the spill-to-temp-file fix that round (2) is built on.
-- @luchezarno — reported #4 with a detailed Git Bash log that pinpointed the ConPTY post-prompt redraw burst as the cause of the dropped grep matches; the round (3) renderer rewrite would have taken much longer to land without that reproducer.
+- @doraemonkeys — reported the oversized-output overflow as #1 and contributed PR #5 (round 2's spill-to-tempfile fix).
+- @luchezarno — reported #4 with a detailed Git Bash log that pinpointed the ConPTY post-prompt redraw burst as the cause of the dropped grep matches.
 
 ### Added
 
-- **`Services/VtLiteState.cs`** — the VT-100 interpreter formerly embedded in `CommandTracker` is now a public class with a streaming `Feed(ReadOnlySpan<char>)` entry point. A 16 KB pending-escape buffer stitches CSI / OSC sequences split across PTY reads (`ParseEscape` returns -1 on incomplete; `Feed` buffers the tail and flushes on the next call). The static `VtLite(...)` one-shot helper is preserved for compatibility.
-- **CSI catalog growth.** `ECH` (`\e[nX`), `DCH` (`\e[nP`), `ICH` (`\e[n@`), `IL` (`\e[nL`), `DL` (`\e[nM`) handlers added — readline / PSReadLine emit these for in-line editing and they were previously dropped to the silent-default branch, leaving the rendered grid divergent from the live screen.
-- **`ConsoleWorker.AnswerAndStripDsr`** — pure static helper modelled on `ReplaceOscTitle` that carries up to 3 partial DSR prefix bytes (`\x1b`, `\x1b[`, or `\x1b[6`) across PTY reads via a `ref string pendingPrefix`. Fires the reply callback once per detected DSR (was one reply per chunk regardless of count) and strips the partial prefix from output so it never leaks downstream into `OscParser` / mirror / AI-visible bytes.
-- **`Services/CommandOutputCapture.cs`** — bounded raw-capture store (small hot char buffer + scratch-file spill, offset-based slice readers + bounded current-command snapshot for timeout `partialOutput`). Worker-private; distinct from the public `ripple.output` spill directory.
-- **`Services/CompletedCommandSnapshot.cs`** — lightweight record the tracker emits on primary completion: capture handle, command-window offsets, exit metadata, cwd, shell family, settle policy, and the exact `ptyPayload` baseline (for deterministic echo stripping).
+- **`Services/VtLiteState.cs`** — VT-100 interpreter formerly embedded in `CommandTracker`, now a public class with `Feed(ReadOnlySpan<char>)`. A 16 KB pending-escape buffer stitches CSI / OSC sequences split across PTY reads. The static `VtLite(...)` one-shot helper is preserved for compatibility.
+
+- **CSI catalog growth.** `ECH`, `DCH`, `ICH`, `IL`, `DL` handlers added — readline / PSReadLine emit these for in-line editing; previously dropped to the silent default branch.
+
+- **`ConsoleWorker.AnswerAndStripDsr`** — pure helper carrying up to 3 partial DSR prefix bytes across PTY reads via `ref string pendingPrefix`. Fires the reply callback once per detected DSR (was once per chunk regardless of count) and strips the partial prefix from output so it never leaks downstream.
+
+- **`Services/CommandOutputCapture.cs`** — bounded raw-capture store (small hot char buffer + scratch-file spill, offset-based slice readers + bounded snapshot for timeout `partialOutput`). Worker-private; distinct from the public `ripple.output` spill directory.
+
+- **`Services/CompletedCommandSnapshot.cs`** — lightweight record the tracker emits on primary completion: capture handle, command-window offsets, exit metadata, cwd, shell family, settle policy, and the exact `ptyPayload` baseline.
+
 - **`Services/CommandOutputFinalizer.cs`** — slice-reader-driven cleaner + `EchoStripper` for `deterministic_byte_match` adapters. Reads from offset-based capture slices instead of rebuilding tracker state from one monolithic in-memory output buffer.
-- **`Services/OutputTruncationHelper.cs`** — preview + spill-file creation, DI-friendly (`IOutputSpillFileSystem`, `IClock`). Returns `OutputTruncationResult(DisplayOutput, SpillFilePath?)`. Accepts a live-path predicate for lease-aware cleanup. Threshold `15_000`, head `~1_000`, tail `~2_000`, newline scan `±200`, retention `120 min`. Files still referenced by undrained cached results are never cleaned.
-- **34 `VtLiteStateTests` asserts** including a "split at every byte boundary agrees with whole-feed final state" property test, alt-screen save/restore preservation of the primary cursor, SGR no-shift verification (the regression the prior byte-counter estimator hit), bracketed-paste passthrough, and pending-buffer overflow safety. Plus 29 new `ConsoleWorker Unit Tests` asserts covering all three DSR split boundaries, three-way splits, false-partial flush, and non-DSR CSI passthrough.
-- **1 MiB Feed throughput bench** prints at the end of `--test` (informational, not a pass/fail). Baseline on a Win11 AOT release: 1.00 MiB in 5.7 ms (174 MiB/s) — the memo's `<5%` overhead bar is cleared with three orders of magnitude of headroom.
-- **Spill / finalize unit + integration coverage** — new test classes `OutputTruncationHelper Tests` (32 asserts), `CommandOutputCapture Tests` (20), `CommandOutputFinalizer Tests` (22), and `ConsoleWorker Cache Unit Tests` (59) cover the truncation, spill-file lifecycle, lease-aware cleanup, capture window semantics, and inline-vs-deferred delivery routing introduced this release. End-to-end `SpillIntegrationTests` (41 asserts under `--test --e2e`) cover oversized inline + deferred spill, lease-aware cleanup, and trailing-byte on-disk slice checks.
+
+- **`Services/OutputTruncationHelper.cs`** — preview + spill-file creation, DI-friendly (`IOutputSpillFileSystem`, `IClock`). Threshold 15,000 chars, head ~1,000, tail ~2,000, newline scan ±200, retention 120 min. Files referenced by undrained cached results are never cleaned.
+
+- **`Services/CommandOutputRenderer.cs`** — cell-based per-command fork of `VtLiteState`. Optional `VtLiteSnapshot` baseline; rows pre-populated from the snapshot grid, cursor / saved cursor / scroll region / SGR / alt-screen state carry over, baseline rows stash a `BaselineCells` copy for the per-cell change detector. Implements CUU/CUD/CUF/CUB/CNL/CPL/CHA/VPA, CUP/HVP, EL/ED, ECH, DCH/ICH, IL/DL, save/restore, alt-screen save/restore, viewport-top tracking.
+
+- **`VtLiteState.Snapshot()` + per-row soft-wrap + active-SGR tracking.** Snapshot deep-copies primary + alternate grids, soft-wrap flags, cursor, saved cursor, scroll region, alt-screen flag, and accumulated active SGR. `WriteChar`'s auto-wrap flips a per-row `ContinuedFromAbove` flag (set on wrap, cleared on hard LF / EraseLine mode 2 / EraseDisplay; shifted with grid rows on scroll). `RecordSgr` accumulates non-reset SGR since the last `\e[m` so the snapshot's `ActiveSgr` can seed the renderer's first-cell prefix.
+
+- **`CompletedCommandSnapshot.VtBaseline`** — optional snapshot field threaded through `CommandTracker` ↔ `ConsoleWorker` ↔ `CommandOutputFinalizer.Clean`. The worker snapshots `_vtState` (session-wide, not the tracker's per-OSC-C-reset one) right before forwarding the OSC C event so the renderer receives the screen state ConPTY has at command start.
+
+- **Soft-wrap re-joining at render time.** Rows with the `ContinuedFromAbove` flag append to the previous emitted line without an inter-row newline, so a long `git log --oneline` entry reaches the AI as one logical line.
+
+- **Alt-screen as placeholder.** Entry switches to a separate row list for alt-buffer writes; exit restores the main-buffer cursor and inserts a single `[interactive screen session]` line. ConPTY's post-exit redraw of the saved main buffer is naturally absorbed by the per-cell baseline diff.
+
+- **Regex-prompt cap.** `RegexPromptDetector.Scan` returns `(Start, End)` per match. Worker fires synthetic `CommandFinished` + `PromptStart` at `Start` so visible prompt characters are excluded from the `[commandStart, OSC A]` window — fixes trailing `(Pdb)` / `DB<N>` / `>` leak for pdb / perldb / python / any regex-prompt REPL. `Start` also backs past contiguous non-reset SGR immediately preceding the prompt match (REPL prompt decoration).
+
+- **Test coverage:** 34 `VtLiteStateTests` asserts (split-at-every-byte property test, alt-screen save/restore, SGR no-shift, bracketed paste, pending-buffer overflow safety); 29 new `ConsoleWorker Unit Tests` for DSR splits; spill / finalize coverage in `OutputTruncationHelper Tests` (32), `CommandOutputCapture Tests` (20), `CommandOutputFinalizer Tests` (22), `ConsoleWorker Cache Unit Tests` (59); end-to-end `SpillIntegrationTests` (41 under `--test --e2e`); 23 new renderer tests. 728 tests pass.
+
+- **1 MiB Feed throughput bench** (informational, not pass/fail). Baseline on Win11 AOT release: 174 MiB/s — the `<5%` overhead bar is cleared with three orders of magnitude of headroom.
 
 ### Changed
 
-- **DSR reply on Unix uses live cursor state.** The reply now reads `_vtState.Row+1`/`Col+1` instead of static row + `EstimateCursorCol`, with the heuristic retained only as a fallback for the brief pre-first-chunk window during shell startup. Windows path is dormant in practice — ConPTY intercepts DSR before ripple sees it.
-- **`peek_console` snapshot routes through live state.** `CommandTracker.GetRecentOutputSnapshot` returns `_vtState.Render()` directly instead of re-parsing the 4 KB recent-output ring through a fresh `VtLite()` on every call. The tracker keeps its own `VtLiteState` fed from `FeedOutput`, reset on the same triggers as the ring (first OSC A, every OSC C, `ClearRecentOutput`, terminal resize). The raw ring buffer is retained for `GetRawRecentBytes()` — `ModeDetector` reads bytes pre-VT-reshape and can't use the rendered snapshot.
-- **Allocation-minimal `Feed` hot path.** `Feed`, `ParseEscape`, and `ApplyCsi` now operate on `ReadOnlySpan<char>` directly — no `new string(input)` per chunk; `paramsStr.Split(';')` replaced with a zero-alloc `GetParam` helper that scans the span. Pending merges use a 512-char `stackalloc` buffer with `ArrayPool<char>` fallback for larger merges. With allocation pressure removed, live tracking runs on every platform; the earlier `!OperatingSystem.IsWindows()` gate (added when GC pressure caused intermittent deno adapter-test flakes) was deleted.
-- **Finalize ownership moved from `CommandTracker` to `ConsoleWorker`.** The tracker now only emits a `CompletedCommandSnapshot` on primary completion; the worker runs cleaning, echo-stripping, truncation, and cache insertion in one place. `ConsoleManager` no longer reassembles output via `drain_post_output` — it forwards the worker's finalized `CommandResult` directly. Inline `execute_command` and deferred `wait_for_completion` therefore always read from the same finalized result shape (`output`, `spillFilePath`, `statusLine`, `exitCode`).
-- **`Build.ps1` gains `-Sign`.** Optional Authenticode signing of `dist/ripple.exe` before the npm/dist deploy step. Defaults preserve the existing unsigned dev workflow; pass `-Sign` for publish builds. PFX password is read interactively via `Read-Host -AsSecureString` — never echoed, never logged.
+- **DSR reply uses live cursor state.** Reads `_vtState.Row+1` / `Col+1` instead of static row + heuristic column. Heuristic retained only as fallback during the pre-first-chunk shell-startup window. Windows path is dormant in practice — ConPTY intercepts DSR before ripple sees it.
+
+- **`peek_console` snapshot routes through live state.** `GetRecentOutputSnapshot` returns `_vtState.Render()` directly instead of re-parsing the recent-output ring through a fresh `VtLite()` on every call. Tracker keeps its own `VtLiteState` fed from `FeedOutput`, reset on the same triggers as the ring. Raw ring buffer is retained for `GetRawRecentBytes()` — `ModeDetector` reads bytes pre-VT-reshape.
+
+- **Allocation-minimal `Feed` hot path.** `Feed` / `ParseEscape` / `ApplyCsi` operate on `ReadOnlySpan<char>` directly. `paramsStr.Split(';')` replaced with a zero-alloc `GetParam` helper; pending merges use a 512-char `stackalloc` buffer with `ArrayPool<char>` fallback. With allocation pressure removed, live tracking runs on every platform — the earlier `!OperatingSystem.IsWindows()` gate (added when GC pressure caused deno adapter-test flakes) is gone.
+
+- **Finalize ownership moved from `CommandTracker` to `ConsoleWorker`.** Tracker now only emits a `CompletedCommandSnapshot` on primary completion; worker runs cleaning, echo-stripping, truncation, and cache insertion in one place. `ConsoleManager` no longer reassembles output via `drain_post_output` — it forwards the worker's finalized `CommandResult` directly. Inline and deferred always read from the same finalized result shape.
+
+- **Bare `\r` is now cursor-reset only (no row clear).** Matches what the human sees in the live terminal. Spec semantics produce identical results for properly-formed progress bars (`\r\x1b[K` or full rewrites); slightly truthier results for short rewrites that match the live-terminal residue.
+
+- **Node REPL integration script emits OSC bytes BEFORE the visible prompt** instead of after — same pattern pwsh's prompt fn has always used. Eliminates the trailing `> ` on every node REPL command.
+
+- **`Build.ps1` gains `-Sign`.** Optional Authenticode signing of `dist/ripple.exe` before npm/dist deploy. Defaults preserve unsigned dev workflow; pass `-Sign` for publish builds. PFX password read interactively via `Read-Host -AsSecureString`.
 
 ### Fixed
 
-- **Cross-chunk DSR queries no longer leak downstream.** The old `text.Contains("\x1b[6n")` substring check missed DSR queries whose 4 bytes straddled two PTY reads. The partial ESC bytes flowed into the parser / mirror / output stream while the shell sat indefinitely waiting for a reply that never fired. The new `AnswerAndStripDsr` buffers the partial prefix, completes it on the next chunk, replies once, and strips the bytes from output.
-- **Orphaned inline `TaskCompletionSource` on `HandleExecuteAsync` timeout / shell-exit branches.** Previously the inline TCS was not detached on those branches, so a timed-out snapshot could be delivered to a stale TCS instead of the worker cache — breaking `wait_for_completion`'s ability to drain timed-out commands. Per-id routing through the new `_inlineDeliveriesById` dictionary closes the race; orphaned ids fall through to `_cachedResults`.
-- **OSC stripping no longer swallows past a prior ST terminator.** `Services/CommandOutputFinalizer.cs`'s OSC alternative `\x1b\][^\x07]*\x07` previously matched across an earlier `ESC \\` (ST) terminator to a later bare BEL when input mixed ST-terminated title OSCs with subsequent BELs (commonly emitted in xterm/iTerm sessions). Tightened to `\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)` so each OSC stops at its own terminator.
-- **Unix spill file permissions.** Spill directory is created `0700` and spill files `0600` via `UnixCreateMode` on .NET 9 — command output (which can contain secrets) is no longer world-readable on multi-user hosts.
-- **Progress-bar redraws no longer flood the MCP `output`.** `CommandOutputFinalizer.StripAnsi` is rewritten as a grid-less line + cursor-row tracker: bare `\r` overwrites the current line in place (dotnet-build / pip-download style spinners), CSI cursor-up (`A`) rewinds the row index, CSI erase-in-line (`K`) / erase-in-display (`J`) clear the current row, `\b` undoes one character. Previously these were stripped as raw bytes, so each redraw landed as a fresh line and a `./Build.ps1` invocation filled the AI-visible output with dozens of stale frames. SGR (color) is still kept verbatim. The visible-terminal mirror is untouched — the human still sees a live progress bar exactly as the shell intended; only the AI-facing `output` collapses.
+- **#4 — `echo … | grep` on Git Bash via ConPTY no longer drops trailing match lines.** ConPTY's screen-redraw burst around prompts contains real grep output (`cherry`, `elderberry`) plus absolute cursor positioning that the legacy `StripAnsi` silently dropped — leaving only the first match (`banana`). The renderer processes cursor positioning correctly and per-cell baseline diff treats matching repaint as idempotent — all matches survive.
 
-### Renderer overhaul (round 3 — closes #4)
+- **Cross-chunk DSR queries no longer leak downstream.** Old `text.Contains("\x1b[6n")` substring check missed DSR queries straddling two PTY reads. Partial ESC bytes flowed into parser / mirror / output; shell sat indefinitely waiting for a reply that never fired. New `AnswerAndStripDsr` buffers the partial prefix, completes on next chunk, replies once.
 
-#### Added
+- **Orphaned inline `TaskCompletionSource` on `HandleExecuteAsync` timeout / shell-exit.** Previously the inline TCS was not detached on those branches, breaking `wait_for_completion`'s ability to drain timed-out commands. Per-id routing through `_inlineDeliveriesById` closes the race.
 
-- **`Services/CommandOutputRenderer.cs`** — cell-based per-command fork of the live `VtLiteState`. Constructor accepts an optional `VtLiteSnapshot` baseline; rows are pre-populated from the snapshot grid, cursor / saved-cursor / scroll-region / SGR / alt-screen state carry over, and each baseline row stashes a `BaselineCells` immutable copy for the per-cell change detector at `Render` time. Implements CUU/CUD/CUF/CUB/CNL/CPL/CHA/VPA, CUP/HVP, EL/ED, ECH, DCH/ICH, IL/DL, save/restore, real alt-screen save/restore semantics, and viewport-top tracking that increments on LFs crossing the snapshot's viewport bottom so subsequent CUP coordinates land on the rows ConPTY actually intends.
-- **`VtLiteState.Snapshot()` + per-row soft-wrap + active-SGR tracking.** New `VtLiteSnapshot` deep-copy record carries primary + alternate grids, soft-wrap flags, cursor, saved cursor, scroll region, alt-screen flag, and the active SGR carry-over. `WriteChar`'s auto-wrap now flips a per-row "continued from above" flag (set on wrap, cleared on hard LF / EraseLine mode 2 / EraseDisplay; shifted in lockstep with grid rows on `ScrollUp` / `ScrollDown`). `RecordSgr` accumulates non-reset SGR sequences since the last `\e[m` / `\e[0m` / leading-0 compound reset so the snapshot's `ActiveSgr` can seed the renderer's first-cell prefix.
-- **`CompletedCommandSnapshot.VtBaseline`** — optional snapshot field threaded through `CommandTracker` ↔ `ConsoleWorker` ↔ `CommandOutputFinalizer.Clean`. The worker snapshots `_vtState` (session-wide, not the tracker's per-OSC-C-reset one) right before forwarding the OSC C event so the renderer receives the screen state ConPTY has at command start.
-- **Soft-wrap re-joining at render time.** Rows whose `ContinuedFromAbove` flag is set are appended to the previous emitted line without an inter-row newline, so a long `git log --oneline` entry that auto-wrapped at the PTY's right margin reaches the AI as one logical line.
-- **Alt-screen as placeholder.** Entry switches to a separate row list for alt-buffer writes; exit restores the main-buffer cursor and inserts a single `[interactive screen session]` line in the rendered output. ConPTY's post-exit redraw of the saved main buffer is naturally absorbed by the per-cell baseline diff (cells already hold the expected values).
-- **Regex-prompt cap.** `RegexPromptDetector.Scan` returns `(Start, End)` per match (was end-only). Worker fires synthetic `CommandFinished` + `PromptStart` at `Start` so the visible prompt characters are excluded from the `[commandStart, OSC A]` window — fixes trailing `(Pdb)` / `DB<N>` / `>` leak for pdb / perldb / python / and any other regex-prompt REPL. `Start` also backs past contiguous non-reset SGR sequences immediately preceding the prompt match (REPL prompt decoration), bounded at any reset SGR (the prior command's "stop coloring" closer) and at any non-SGR byte including whitespace.
-- **23 new tests** covering snapshot independence, soft-wrap flags, SGR set/reset/compound, baseline-skip-pre-command, ConPTY-repaint-idempotent, alt-screen+baseline placeholder, soft-wrap re-join, regex-prompt Start vs End semantics, prompt-decoration SGR back-up, and reset-SGR halt. All 728 tests pass.
+- **OSC stripping no longer swallows past a prior ST terminator.** OSC alternative `\x1b\][^\x07]*\x07` previously matched across an earlier `ESC \\` (ST) terminator to a later bare BEL when input mixed ST-terminated title OSCs with subsequent BELs. Tightened so each OSC stops at its own terminator.
 
-#### Changed
+- **Unix spill file permissions.** Spill directory is `0700`, files `0600` via `UnixCreateMode` on .NET 9. Command output (which can contain secrets) is no longer world-readable on multi-user hosts.
 
-- **Bare `\r` is now cursor-reset only (no row clear).** Matches what the human sees in the live terminal — verified empirically against Git Bash via ripple MCP. The legacy "clear the row on bare CR" is intentionally lossier than terminal spec; with the cell-based renderer in place, the spec semantics produce identical results for properly-formed progress bars (which use `\r\x1b[K` or full-replacement rewrites) and slightly truthier results for short rewrites (which match the live-terminal residue).
-- **Node.js integration script (`integration.js`) emits OSC bytes BEFORE the visible prompt** instead of after. Same pattern pwsh's prompt function has always used. Eliminates the trailing `> ` on every node REPL command. OSC sequences are zero-width so emitting them at any cursor position is safe; the previous "after" ordering was conservative but unnecessary.
+- **Progress-bar redraws no longer flood AI-visible output.** `StripAnsi` rewritten as a line + cursor-row tracker: bare `\r` overwrites in place, CSI cursor-up rewinds row index, EL/ED clears, `\b` undoes one char. Previously stripped as raw bytes; a `./Build.ps1` invocation filled output with dozens of stale frames. Visible mirror is untouched — human still sees a live progress bar.
 
-#### Fixed
+- **Trailing `\e[m` reset SGR is no longer lost** when output ends `text\r\n\e[m`. `Render` flushes pending SGR to the last non-empty row's `TrailingSgr` so end-of-output color resets reach downstream consumers instead of leaving color stuck on.
 
-- **Issue #4 — `echo … | grep` on Git Bash via ConPTY no longer drops trailing match lines.** ConPTY emits a screen-redraw burst around prompts that contains real grep output (`cherry`, `elderberry`) and absolute cursor positioning the legacy `StripAnsi` silently dropped, leaving only the first match (`banana`) in the cleaned output. The new renderer processes the cursor positioning correctly and the per-cell baseline diff treats matching repaint as idempotent — all three matches survive intact.
-- **Trailing `\e[m` reset SGR is no longer lost** when the output ends with `text\r\n\e[m`. `Render` flushes pending SGR to the last non-empty row's `TrailingSgr` before iterating rows, so end-of-output color resets reach downstream consumers instead of leaving "color stuck on" state.
+### Known limitation
 
-#### Known limitation
-
-- **First alt-screen run on a fresh console after one or more prior non-alt commands** may include ConPTY's post-exit redraw of the visible session history in the MCP response (typically 3–6 prior prompts). Subsequent alt-screen runs in the same console produce clean output. Cause: a subtle divergence between `ConsoleWorker._vtState`'s incremental session state and ConPTY's screen view; the first ConPTY full redraw syncs them. Fix deferred to a follow-up PR; mitigation is to either ignore the first noisy response or to discard one warm-up command. Affects only alt-screen workflows (vim, less, htop) on the very first such command of a session.
+- **First alt-screen run on a fresh console after non-alt commands** may include ConPTY's post-exit redraw of the visible session history (typically 3–6 prior prompts). Subsequent alt-screen runs in the same console produce clean output. Cause: subtle divergence between `ConsoleWorker._vtState` incremental session state and ConPTY's screen view; the first ConPTY full redraw syncs them. Mitigation: ignore the first noisy response or discard one warm-up command. Affects only alt-screen workflows (vim, less, htop) on the very first such command of a session.
 
 ### Release infrastructure
 
-- **`.github/workflows/release.yml`** triggers on `v*` tag pushes. NativeAOT publish, unit-test gate, tag/version cross-check, then Azure OIDC login → Authenticode sign via Azure Key Vault (`kv-yotsuda-sign`) → `npm publish --access public --provenance` → `gh release create` with the per-version CHANGELOG section as the release body and `dist\ripple.exe` attached. The `release` environment requires reviewer approval and locks deploys to `v*` tags. Federated credential is repo+environment scoped; no client secret stored in the repo. The npm publish carries an [SLSA build provenance attestation](https://docs.npmjs.com/generating-provenance-statements) that anyone can verify back to this exact workflow run.
+`.github/workflows/release.yml` triggers on `v*` tag pushes. NativeAOT publish, unit-test gate, tag/version cross-check, then Azure OIDC login → Authenticode sign via Azure Key Vault (`kv-yotsuda-sign`) → `npm publish --access public --provenance` → `gh release create` with the per-version CHANGELOG section as release body and `dist\ripple.exe` attached. The `release` environment requires reviewer approval and locks deploys to `v*` tags. Federated credential is repo+environment scoped; no client secret stored in the repo. The npm publish carries an [SLSA build provenance attestation](https://docs.npmjs.com/generating-provenance-statements) verifiable back to the workflow run.
 
 ## [0.8.0] - 2026-04-16
 
-First round of **debugger adapters** plus three new REPL adapters and
-two root-cause fixes that together close out the user-input-
-contamination class of flakes. The adapter schema gains three
-additive fields (`process.executable_candidates`,
-`modes.advance_commands`, `commands.debugger`) that let a single
-adapter YAML describe any debugger's step / print / breakpoint
-vocabulary in a vendor-agnostic way — AI agents drive perldb and
-jdb using the same operation names, no per-debugger knowledge
-required. **18 embedded adapters** (up from 12), with perldb / jdb /
-pdb the first members of the `family: debugger` class. `--adapter-
-tests` runs 100 assertions green; window creation during the test
-suite is fully silent (test workers launch with SW_HIDE) so a long
-test run no longer disrupts the user's other windows.
+**Debuggers as a first-class adapter type.** The schema gains three additive fields — `process.executable_candidates`, `modes.advance_commands`, `commands.debugger` — so a single YAML can describe any debugger's step / print / breakpoint vocabulary in a vendor-agnostic way. AI agents drive perldb and jdb using the same operation names, no per-debugger knowledge required. perldb / jdb / pdb are the first `family: debugger` adapters.
+
+Three new debugger adapters plus three new REPLs (sqlite3, lua, deno) bring the embedded set to **18 adapters**. Plus two root-cause fixes that close out the user-input-contamination class of flakes: a hold-gate buffers user keystrokes during AI command execution, and `--adapter-tests` worker windows launch fully hidden (SW_HIDE) so a long test run no longer disrupts the user's other windows. 100 adapter assertions green.
 
 ### Added
-- **`family: debugger` adapter framework.** The `family` enum value
-  `debugger` moves from declarative-only (CCL's break-loop mode +
-  python's pdb mode, both inherited inside a REPL) to a first-class
-  adapter type with three independently-verified instances:
-  - **`perldb`** — Perl's `perl -d -e 0` scriptless debugger. Prompt
-    `  DB<N> ` with nested form `  DB<<N>> ` fired on breakpoint
-    pause. Regex strategy + init none. 8 adapter tests, including an
-    end-to-end breakpoint-hit / inspect-parameter / continue /
-    verify-return chain.
-  - **`jdb`** — Java Debugger detached mode (`jdb` with no target
-    class). Prompt `> `. 5 adapter tests covering deferred
-    breakpoint registration, meta-command dispatch, and detached-
-    mode restrictions.
-  - **`pdb`** — Python's built-in debugger via
-    `python -c "import pdb; pdb.Pdb().set_trace()"`. Prompt
-    `(Pdb) `. 6 adapter tests.
-- **`process.executable_candidates`** (schema §3). Ordered list of
-  launcher binaries tried left-to-right with `%VAR%` env-var
-  expansion; first entry that resolves to an existing file wins.
-  Solves the "single absolute path doesn't port across distributions"
-  problem for interpreters with multiple plausible install locations
-  (Strawberry / ActivePerl / Git-bundled perl; Microsoft OpenJDK /
-  Temurin / Corretto / Zulu; python.org / Windows Store / Anaconda).
-  Falls back to the legacy `executable` field, then the adapter name.
-- **`commands.debugger`** (schema §10). Structured debugger-operation
-  vocabulary: navigation (`step_in`, `step_over`, `step_out`,
-  `continue`, `run`), inspection (`print`, `dump`, `backtrace`,
-  `source_list`, `locals`, `where`, `args`), breakpoints
-  (`breakpoint_set`, `breakpoint_set_line`, `breakpoint_list`,
-  `breakpoint_clear_all`). Each field is a command template string
-  with `{expr}` / `{target}` / `{line}` / `{file}` placeholders, or
-  `null` when unsupported. AI agents discover a debugger's syntax
-  from the adapter instead of parsing help text.
-- **`modes.advance_commands`** (schema §9). Distinct from
-  `exit_commands`: advance commands (step_in / step_over / step_out)
-  change position within the same paused mode without leaving it.
-  AI agents use this to distinguish "I stepped one line but I'm
-  still paused" from "I resumed and left the breakpoint".
-- **`sqlite3` REPL adapter.** Launches `sqlite3 :memory:` with
-  `.mode list` + `.headers off` forced at startup so query output
-  is pipe-separated and regex-friendly (sqlite 3.33+ defaults to a
-  pretty "box" render otherwise). Dot-commands documented via
-  `commands.builtin`. 6 tests.
-- **`lua` REPL adapter.** Lua 5.4 interactive interpreter with the
-  classic `> ` prompt. Uses the `=` prefix shortcut (Lua 5.3+) in
-  probes to return values without wrapping in `print()`. 6 tests.
-- **`deno` REPL adapter.** Deno 2.x for JavaScript / TypeScript
-  evaluation. Distinct from the node adapter — Deno evaluates
-  TypeScript directly (`const x: number = 42` works without
-  ts-node), supports top-level await natively, and has built-in
-  Web Platform APIs. `NO_COLOR=1` in the adapter env disables
-  ANSI colorization for clean regex matching. 6 tests.
-- **`--no-user-input` worker flag.** Test workers launched via
-  `AdapterDeclaredTestsRunner` now pass this flag so their
-  `InputForwardLoop` permanently holds (suppresses) user
-  keystrokes. Prevents the user's typing in unrelated windows from
-  leaking into test workers' PTYs and corrupting probe commands —
-  the root cause of the intermittent jshell / node / fsi /
-  jdb-hello flakes on the 0.7 release train.
-- **OSC sequence stripping in `RegexPromptDetector`.**
-  `StripCsiWithMap` now consumes `ESC ] ... BEL` and `ESC ] ... ESC \`
-  in addition to CSI. Fixes the class of failures where ConPTY's
-  window-title setter (`ESC ] 0 ; <path> BEL`) emitted right after
-  process launch sat between the banner and the prompt, preventing
-  `^` anchoring. 3 regression tests in
-  `RegexPromptDetectorTests`.
+
+- **`family: debugger` adapter framework with three instances.**
+  - **`perldb`** — Perl `perl -d -e 0` scriptless debugger. Prompt `  DB<N> `, nested `  DB<<N>> ` on breakpoint pause. 8 tests including end-to-end breakpoint-hit / inspect / continue / verify-return chain.
+  - **`jdb`** — Java Debugger detached mode (`jdb` with no target class). Prompt `> `. 5 tests covering deferred breakpoint registration, meta-command dispatch, detached-mode restrictions.
+  - **`pdb`** — Python's built-in debugger via `python -c "import pdb; pdb.Pdb().set_trace()"`. Prompt `(Pdb) `. 6 tests.
+
+- **`process.executable_candidates`** (schema §3). Ordered launcher list tried left-to-right with `%VAR%` env expansion; first existing file wins. Solves "single absolute path doesn't port across distributions" for interpreters with multiple install locations (Strawberry / ActivePerl / Git-bundled perl; Microsoft OpenJDK / Temurin / Corretto / Zulu; python.org / Windows Store / Anaconda). Falls back to `executable`, then the adapter name.
+
+- **`commands.debugger`** (schema §10). Structured debugger vocabulary: navigation (`step_in`, `step_over`, `step_out`, `continue`, `run`), inspection (`print`, `dump`, `backtrace`, `source_list`, `locals`, `where`, `args`), breakpoints (`breakpoint_set`, `breakpoint_set_line`, `breakpoint_list`, `breakpoint_clear_all`). Each field is a template with `{expr}` / `{target}` / `{line}` / `{file}` placeholders, or `null` when unsupported. AI agents discover the syntax from the adapter instead of parsing help text.
+
+- **`modes.advance_commands`** (schema §9). Distinct from `exit_commands`: advance commands (step_in / step_over / step_out) change position within the same paused mode without leaving it. Lets AI agents distinguish "stepped one line, still paused" from "resumed and left the breakpoint".
+
+- **`sqlite3` REPL adapter.** `sqlite3 :memory:` with `.mode list` + `.headers off` forced at startup so query output is pipe-separated and regex-friendly. 6 tests.
+
+- **`lua` REPL adapter.** Lua 5.4 interactive interpreter with classic `> ` prompt. Probes use the `=` prefix shortcut (Lua 5.3+) to return values without `print()`. 6 tests.
+
+- **`deno` REPL adapter.** Deno 2.x for JavaScript / TypeScript. Distinct from node — Deno evaluates TypeScript directly (no ts-node), supports top-level await, has built-in Web Platform APIs. `NO_COLOR=1` for clean regex matching. 6 tests.
+
+- **`--no-user-input` worker flag.** Test workers permanently hold user keystrokes via `InputForwardLoop`. Prevents typing in unrelated windows from leaking into test PTYs — the root cause of the intermittent jshell / node / fsi / jdb-hello flakes on the 0.7 release train.
+
+- **OSC sequence stripping in `RegexPromptDetector`.** `StripCsiWithMap` now consumes `ESC ] ... BEL` and `ESC ] ... ESC \` in addition to CSI. Fixes failures where ConPTY's window-title setter (`ESC ] 0 ; <path> BEL`) sat between banner and prompt, preventing `^` anchoring.
 
 ### Changed
-- **User input is now held during AI command execution.** A new
-  `_holdUserInput` gate in `ConsoleWorker` causes `InputForwardLoop`
-  to buffer keystrokes into `_heldUserInput` instead of forwarding
-  them to the PTY while `HandleExecuteAsync` is in flight. Held
-  bytes replay automatically after the command completes (success /
-  timeout / error). Ctrl+C (0x03) passes through even when held so
-  the user can always interrupt a stuck command. Operates at
-  ripple's own forwarding layer (above the shell), making it
-  universal across adapters regardless of whether the shell has a
-  line editor. The hold gate and the pre-existing `input.clear_line`
-  field cover complementary windows and both remain in use:
-  - **Hold gate** protects the *during-command* window — keystrokes
-    typed between the moment the AI command arrives and the moment
-    its output drains.
-  - **`input.clear_line`** protects the *between-command* window —
-    keystrokes the user typed into the shared console (which is
-    ripple's whole design promise) that already reached the shell's
-    line editor before the next AI command arrived. clear_line
-    issues the line-editor-kill bytes (Ctrl-A + Ctrl-K for readline)
-    right before submitting the AI command so pre-typed partial
-    input doesn't prefix it. Removing clear_line would require
-    extending the hold gate to also cover the between-command
-    window, which would silently break the shared-console contract
-    that lets the user type into ripple's terminal as their own
-    workspace.
-- **`--adapter-tests` worker console windows are hidden (SW_HIDE).**
-  Normal ripple usage keeps `SW_SHOWNOACTIVATE` so the shared
-  console is visible-but-inactive; test runs gate on `noUserInput`
-  to switch to fully invisible windows. Rapid window creation
-  during a full test suite (15+ workers) previously caused focus
-  churn that disrupted the user's other windows — now the entire
-  test run is silent.
+
+- **User input held during AI command execution.** New `_holdUserInput` gate buffers keystrokes into `_heldUserInput` instead of forwarding to the PTY while `HandleExecuteAsync` is in flight. Held bytes replay after the command completes (success / timeout / error). Ctrl+C passes through even when held so the user can always interrupt. Operates at ripple's forwarding layer (above the shell), universal across adapters regardless of line-editor presence.
+
+  The hold gate complements the pre-existing `input.clear_line` field — they cover different windows. Hold gate protects *during-command* keystrokes (between AI command arrival and output drain). `clear_line` protects *between-command* keystrokes (user-typed bytes already in the shell's line editor before the next AI command), by issuing line-editor-kill bytes (Ctrl-A + Ctrl-K for readline) right before submitting. Both remain in use.
+
+- **`--adapter-tests` worker windows hidden (SW_HIDE).** Normal usage keeps `SW_SHOWNOACTIVATE` (visible-but-inactive). Test runs gate on `noUserInput` to switch to fully invisible windows. Rapid window creation during a full test suite (15+ workers) previously caused focus churn that disrupted the user's other windows — now the entire test run is silent.
 
 ### Fixed
-- **`RegexPromptDetector` missed prompts behind OSC window-title
-  sequences.** Pre-0.8 the stripper handled CSI (`ESC [ ... <letter>`)
-  only, leaving OSC sequences intact in the stripped text. When
-  ConPTY emitted `ESC ] 0 ; <path-to-executable> BEL` right before
-  the first prompt (standard terminal behaviour for child-process
-  launches), the title bytes sat between the banner newline and
-  the prompt, and a regex like `^> $` could not anchor. The jdb
-  adapter's initial-prompt detection blocked on this exact pattern
-  (commit `0a98d31`). Fix extends `StripCsiWithMap` with an OSC
-  branch that consumes the sequence entirely via BEL or ST
-  terminator.
-- **`CS8600` compiler warning in
-  `ConsoleWorker.HandleExecuteAsync`.** `ModeMatch` is a record
-  (reference type) so `ModeMatch match = default` gave null and
-  triggered flow-analysis warnings at the post-loop `match.Name`
-  access. The `while(true)` loop always reassigns before the
-  post-loop read, but the compiler can't prove it. Fix (commit
-  `f2f3834`): replace `default` with an explicit
-  `new ModeMatch(Name: null, Level: null)` sentinel so the
-  variable is never null and the safety invariant becomes a
-  constructor invocation rather than an unprovable loop property.
-- **jdb adapter's `next`-stepping test** was state-dependent on
-  a previous test leaving the VM paused at the breakpoint. The
-  state-inheriting design is fragile — the `cont` async race (jdb
-  returns the post-resume prompt immediately while the VM is still
-  running, so `Result: 42` stdout arrives after the test runner
-  has already declared the command complete) is also documented
-  in the adapter YAML's comments for future `async_interleave`
-  work.
-- **CCL / ABCL execute_command responses leaked the next `? `
-  prompt.** `CleanDelta`'s trailing-prompt suppressor recognised
-  `$ # % > ❯ λ` but not `?`, so ccl / abcl (whose integration
-  scripts emit a literal `? ` top-level prompt) rendered `(+ 1 1)`
-  as `2\n?` instead of `2`. Fix (commit `ad9d010`): add
-  `line.EndsWith('?')` to `IsShellPrompt`. Nested break-loop
-  prompts (`1 > ` / `2 > `) were already matched via `>` so the
-  fix is scoped to the top-level `? ` case.
+
+- **`RegexPromptDetector` missed prompts behind OSC window-title sequences.** Pre-0.8 the stripper handled CSI only, leaving OSC sequences intact. When ConPTY emitted `ESC ] 0 ; <path> BEL` right before the first prompt, the title bytes sat between banner newline and prompt and a regex like `^> $` couldn't anchor. The jdb adapter's initial-prompt detection blocked on this exact pattern. `StripCsiWithMap` now also consumes OSC via BEL or ST terminator.
+
+- **`CS8600` warning in `HandleExecuteAsync`.** `ModeMatch` is a record (reference type), so `ModeMatch match = default` gave null and triggered flow-analysis warnings. Replaced `default` with an explicit `new ModeMatch(Name: null, Level: null)` sentinel so the variable is never null.
+
+- **jdb `next`-stepping test was state-dependent.** Relied on a previous test leaving the VM paused at a breakpoint. The fragile design and the `cont` async race (jdb returns the post-resume prompt while the VM is still running) are documented in the adapter YAML for future `async_interleave` work.
+
+- **CCL / ABCL `execute_command` responses leaked the next `? ` prompt.** `CleanDelta`'s trailing-prompt suppressor recognised `$ # % > ❯ λ` but not `?`. Fix: add `line.EndsWith('?')` to `IsShellPrompt`. Nested break-loop prompts (`1 > ` / `2 > `) were already matched via `>`.
 
 ### Known limitations
-- **`dotnet-dump analyze` is post-mortem only.** Shipping an
-  adapter for it has the same fixture-dependency problem as
-  `jdb-hello`: a dump file must exist at adapter-launch time.
-  Deferred until there's a concrete workflow that needs dump-
-  analysis integration.
-- **`IPython` prompt detection under ConPTY.** IPython's
-  `--simple-prompt` mode still emits absolute cursor positioning
-  (`\x1b[5;1H`) when it detects a TTY-like environment. `TERM=dumb`
-  and `PROMPT_TOOLKIT_NO_CPR=1` don't override this — it's a
-  ConPTY-specific codepath inside IPython. No IPython adapter
-  ships in 0.8; the stdlib `python` adapter remains the
-  recommended Python REPL.
-- **Adapters using `b subname` on `do`-loaded subs** (perl5db).
-  Setting a function-name breakpoint on a sub that was loaded from
-  an external file via `do 'file.pl'` may silently not fire — the
-  address resolution doesn't always match the file-loaded code.
-  Workaround documented in `perldb.yaml`: use line-number
-  breakpoints (`b {line}`) after `l subname` finds the target lines.
+
+- **`dotnet-dump analyze` is post-mortem only.** Adapter shipping deferred — has the same fixture-dependency problem as `jdb-hello` (a dump file must exist at adapter-launch time).
+- **IPython under ConPTY.** `--simple-prompt` still emits absolute cursor positioning (`\x1b[5;1H`) when it detects a TTY-like environment. `TERM=dumb` and `PROMPT_TOOLKIT_NO_CPR=1` don't override — it's a ConPTY-specific codepath inside IPython. The stdlib `python` adapter remains the recommended Python REPL.
+- **perldb `b subname` on `do`-loaded subs.** Setting a function-name breakpoint on a sub loaded via `do 'file.pl'` may silently not fire — address resolution doesn't always match. Workaround in `perldb.yaml`: use line-number breakpoints (`b {line}`) after `l subname` finds the target lines.
 
 ## [0.7.0] - 2026-04-15
 
-Polish round + shipping the CCL adapter. Seven bug fixes found via
-adversarial testing of the v0.6.0 surface (window title split-chunk
-leak, nested datum comments, node/groovy `signals.interrupt`
-mis-declaration, console focus theft, line-editor buffer flush,
-mode detection against the wrong input source), plus **12 embedded
-adapters** for the first time: `ccl` moves out of the local gitignore
-after empirical confirmation that the corporate AppLocker block which
-motivated the exclusion has been relaxed. Each fix started with a
-complaint or a suspected weakness, pinned the broken behaviour with
-a test, then replaced the implementation. No architecture rewrites;
-the worker / proxy split and the adapter-YAML schema stayed stable
-across all seven. **528 assertions pass** on `--test` (458 unit) +
-`--adapter-tests` (70 declared, 12 adapters). The two pre-existing
-`ConsoleWorkerTests.Run` flakes (Ctrl+C standby, obsolete PTY alive)
-that block `--test --e2e` from reaching the declared suite also
-predate 0.6 and are tracked separately — they're invisible to
-release binaries.
+**Polish round + Clozure Common Lisp ships embedded.** Seven bug fixes from adversarial testing of the v0.6.0 surface — window title split-chunk leak, nested datum comments, node / groovy `signals.interrupt` mis-declaration, console focus theft, line-editor buffer flush, mode detection against the wrong input source. Each fix started with a complaint or a suspected weakness, pinned the broken behaviour with a test, then replaced the implementation.
+
+**12 embedded adapters** for the first time: CCL moves out of the local gitignore after empirical confirmation that the corporate AppLocker block which motivated the exclusion has been relaxed. 528 / 528 assertions pass — `--test` (458 unit) + `--adapter-tests` (70 declared, 12 adapters). The two pre-existing `ConsoleWorkerTests.Run` flakes (Ctrl+C standby, obsolete PTY alive) predate 0.6 and are tracked separately — invisible to release binaries.
 
 ### Fixed
-- **Owned console window titles sometimes got clobbered by the
-  shell.** The read-loop's `ReplaceOscTitle` was stateless and
-  couldn't handle an OSC 0/1/2 title sequence that straddled a PTY
-  read-chunk boundary — the partial opener leaked to the visible
-  terminal and the terminal interpreted bytes 1..N as the shell's
-  title up to whatever terminator eventually arrived, clobbering
-  ripple's desired title. Fix (commit `737f0a3`): add a
-  `ref string pendingTail` parameter so the unterminated opener is
-  buffered on `_oscTitlePending` and reassembled on the next chunk.
-  37 new unit assertions cover split points between `\e` and `]`,
-  between `]` and the type byte, mid-body, right at the terminator,
-  at the ST two-byte terminator, and with non-title OSCs
-  (633, 7, 112) flowing through untouched.
-- **`#;#;(a)` reported complete when it needed a second datum.**
-  The BalancedParensCounter's atom-run-consume branch was
-  decrementing `pendingDatumComments` on atoms inside a
-  datum-commented list — atoms that were already being skipped by
-  the list's own bracket accounting. Stacked datum-comment
-  prefixes with only one following datum therefore silently
-  resolved and the counter reported "submit-ready" when it should
-  have held. Fix (commit `39b6a83`): gate the atom-run branch on
-  `datumCommentAnchorDepths.Count == 0` so inner atoms don't
-  resolve outer prefixes. 32 new stress assertions harden the
-  counter against reader-macro pathologies: char literals of
-  quote / semicolon / pipe / backslash, bracket type mismatch
-  (pinned as a known gap), multi-line strings, 200-deep nesting,
-  quasi-quote, CL `#+nil` passthrough, and the fixed nested
-  datum-comment scenarios.
-- **Node / groovy mis-declared `signals.interrupt`.** Live
-  verification of all 10 adapters' interrupt handlers found two
-  that lied about their capability: Node's REPL cannot handle
-  Ctrl-C while its event loop is blocked by a sync JS loop or
-  pending top-level await (the signal handler runs on the same
-  thread), and groovysh's Ctrl-C is destructive — it terminates
-  the JVM and closes the shell outright. Fix (commit `f19f3c1`):
-  flip `capabilities.interrupt` to `false` for both, set
-  groovy's `signals.interrupt` to `null` so MCP clients don't
-  even try `send_input "\x03"`, and extend SCHEMA §11 with
-  nullable-interrupt semantics. Also: SignalsSpec.Interrupt is
-  now `string?` to support explicit `null` in YAML.
-- **New console windows stole keyboard focus.** `CreateProcessW`
-  with only `CREATE_NEW_CONSOLE` gives the new console active-
-  window status by default, so starting a ripple shell while
-  the user is typing in their editor drops their keystrokes
-  into ripple's buffer. Fix (commit `c90d3f1`): set
-  `STARTF_USESHOWWINDOW | wShowWindow = SW_SHOWNOACTIVATE` in
-  `STARTUPINFOW` so the new window is displayed but not
-  activated. The user's editor keeps focus.
-- **User-typed bytes were prepended to the next AI command.** Even
-  with the focus fix, users occasionally click into a ripple
-  console and type a few keystrokes before noticing. Without a
-  flush, those bytes sit in the shell's line-editor buffer and
-  get submitted together with the next AI command as one garbled
-  line. Fix (same commit `c90d3f1`): new `input.clear_line`
-  schema field carries the bytes to write before each execute
-  to wipe the current line. Default is `null` (opt-in per
-  adapter) because Python `PYTHON_BASIC_REPL=1`, fsi
-  `--readline-`, Racket `-i`, CCL, and ABCL deliberately run
-  without a line editor and would parse the obvious `\x01\x0b`
-  (Ctrl-A + Ctrl-K) as literal input — empirical probe against
-  Python basic REPL produced
-  `SyntaxError: invalid non-printable character U+0001`. Opted
-  in for bash and zsh where readline / ZLE emacs defaults
-  handle the bytes as no-ops on an empty buffer. Eight schema
-  pins in AdapterLoaderTests lock the per-adapter expectations.
-- **`ModeDetector` never saw the post-OSC-A prompt, so every
-  mode transition silently fell through to the default.** The
-  auto_enter + nested + level_capture machinery was scanning
-  `cleanedOutput` (the OSC-C..D slice) for the mode's detect
-  regex. But the mode transition signal lives in the NEXT
-  prompt — `1 > ` for CCL's break loop, `(Pdb) ` for Python,
-  `N] ` for SBCL — which arrives AFTER OSC A fires Resolve, so
-  `cleanedOutput` literally can never contain it. And the
-  obvious alternative (`GetRecentOutputSnapshot()`) routes the
-  ring through VtLite, which reshapes the trailing prompt into
-  cell-addressed coordinates that break `^<prompt>$` anchored
-  regexes. Fix (commit `ca78f95`): scan `GetRawRecentBytes()`
-  in a short 150 ms poll loop, breaking out as soon as a
-  non-default auto_enter mode matches. Verified empirically
-  against a local 4-test chain walking CCL's break loop
-  (`(error ...)` → `1 >` → nested → `2 >` → `:pop` → `1 >` →
-  `:pop` → main). Schema §18 Q2 ("auto_enter + nested +
-  level_capture at runtime") is now backed by runtime evidence
-  rather than just ModeDetector's unit tests.
+
+- **Owned console window titles got clobbered by split-chunk OSC.** `ReplaceOscTitle` was stateless and couldn't handle an OSC 0/1/2 title sequence straddling a PTY read-chunk boundary — the partial opener leaked to the visible terminal and the terminal interpreted following bytes as the shell's title until whatever terminator arrived. Now uses a `ref string pendingTail` to buffer unterminated openers across chunks. 37 new unit asserts cover splits at every byte boundary plus non-title OSCs (633, 7, 112) flowing through untouched.
+
+- **`#;#;(a)` reported submit-ready when it needed a second datum.** `BalancedParensCounter`'s atom-run-consume branch decremented `pendingDatumComments` on atoms inside a datum-commented list — atoms already being skipped by the list's own bracket accounting. Stacked datum-comment prefixes with only one following datum therefore silently resolved. Fix: gate the atom-run branch on `datumCommentAnchorDepths.Count == 0`. 32 new stress asserts cover reader-macro pathologies: char literals of quote / semicolon / pipe / backslash, multi-line strings, 200-deep nesting, quasi-quote, CL `#+nil` passthrough.
+
+- **Node / groovy mis-declared `signals.interrupt`.** Live verification of all 10 adapters found two lies: Node's REPL can't handle Ctrl-C while its event loop is blocked (signal handler runs on the same thread), and groovysh's Ctrl-C terminates the JVM outright. Both flip `capabilities.interrupt` to `false`. Groovy's `signals.interrupt` is now `null` so MCP clients don't even try the send. SCHEMA §11 extended with nullable-interrupt semantics; `SignalsSpec.Interrupt` is now `string?`.
+
+- **New console windows stole keyboard focus.** `CreateProcessW` with only `CREATE_NEW_CONSOLE` activates the new window by default — starting a ripple shell while the user types in their editor dropped keystrokes into ripple's buffer. Now sets `STARTF_USESHOWWINDOW | wShowWindow = SW_SHOWNOACTIVATE`: window displays but isn't activated, editor keeps focus.
+
+- **User-typed bytes prepended to next AI command.** Even with the focus fix, users occasionally click into a ripple console and type before noticing. Those bytes sit in the line editor and get submitted together with the next AI command as one garbled line. New `input.clear_line` schema field carries bytes to write before each execute to wipe the current line. Default `null` (opt-in per adapter) because Python basic REPL / fsi `--readline-` / Racket `-i` / CCL / ABCL run without a line editor and parse `\x01\x0b` (Ctrl-A + Ctrl-K) as literal input. Opted in for bash and zsh where readline / ZLE emacs defaults treat the bytes as no-ops on an empty buffer.
+
+- **`ModeDetector` never saw the post-OSC-A prompt.** Auto_enter + nested + level_capture scanned `cleanedOutput` (the OSC-C..D slice), but the mode-transition signal lives in the NEXT prompt (`1 > ` for CCL's break loop, `(Pdb) ` for Python, `N] ` for SBCL) which arrives AFTER OSC A fires Resolve. `GetRecentOutputSnapshot()` was the obvious alternative but routes the ring through VtLite, which reshapes the trailing prompt into cell-addressed coordinates that break `^<prompt>$` anchors. Fix: scan `GetRawRecentBytes()` in a short 150 ms poll loop, breaking out as soon as a non-default auto_enter mode matches. Verified against a 4-test chain walking CCL's break loop. Schema §18 Q2 is now backed by runtime evidence.
 
 ### Added
-- **Clozure Common Lisp (CCL) adapter ships embedded.** Through
-  v0.6.0 `adapters/ccl.yaml` + `ShellIntegration/integration.lisp`
-  lived locally-only because corporate AppLocker on the dev box
-  blocked user-dir PE files under ConPTY spawn — earlier adapter
-  tests consistently hit `CreateProcessW failed: 5`. On
-  2026-04-15 that block is empirically gone: `--adapter-tests
-  --only ccl` runs 10 / 10 green across repeated runs, covering
-  the probe, five expression-level tests (arithmetic, stateful
-  defparameter, block-comment reader macro, char-literal reader
-  macro, default mode), and the four-test debugger-mode chain
-  that was added this round to verify §18 Q2's auto_enter +
-  nested + level_capture path (`(error ...)` → `1 > `, nested
-  → `2 > `, `:pop` → `1 > `, `:pop` → main). CCL is now the
-  first native-binary Lisp in the embedded set alongside the
-  JVM-hosted ABCL. On boxes where the AppLocker block persists
-  the probe will still soft-fail — same class as a missing
-  zsh on Windows, not a regression.
-- **`--adapter-tests [--only <name>]` CLI flag** — already shipped
-  in 0.6.0 but now documented as the canonical way to exercise
-  adapter-declared tests without the pre-existing E2E flakes in
-  `ConsoleWorkerTests.Run` hard-exiting the process. Useful after
-  adding a new adapter to verify just its own tests in isolation.
-- **`input.clear_line` schema field** — documented in SCHEMA.md §8
-  alongside the empirical-verification requirement ("walk the
-  adapter in ripple, type into its console window, run
-  execute_command, confirm the clear bytes wipe the buffer
-  without syntax errors, then add the field"). Bash and zsh opt-in;
-  everything else null by default.
-- **ABCL 1.9.2 adapter gotcha** in HANDOFF.md — the `--add-opens
-  java.base/java.lang=ALL-UNNAMED` flag on the Groovy-pattern
-  command template silences the JDK 21 virtual-threading
-  introspection warning that ABCL 1.9.2 prints on every cold
-  start.
-- **Pre-existing E2E flake documentation** — HANDOFF.md documents
-  the two `ConsoleWorkerTests.Run` tests (Ctrl+C post-interrupt
-  standby, obsolete PTY alive) that have been failing across
-  sessions and the `--adapter-tests` standalone workaround. On
-  release binaries the flakes are invisible — they only affect
-  the `--test --e2e` contract gate during development.
+
+- **Clozure Common Lisp (CCL) ships embedded.** Through v0.6.0 `adapters/ccl.yaml` + `ShellIntegration/integration.lisp` lived locally-only because corporate AppLocker on the dev box blocked user-dir PE files under ConPTY spawn (`CreateProcessW failed: 5`). On 2026-04-15 that block is empirically gone: `--adapter-tests --only ccl` runs 10 / 10 green covering probe, five expression-level tests (arithmetic, `defparameter` persistence, block-comment / char-literal reader macros, default mode), and a four-test debugger-mode chain verifying §18 Q2's auto_enter + nested + level_capture path. CCL is the first native-binary Lisp in the embedded set alongside the JVM-hosted ABCL. On boxes where AppLocker persists the probe still soft-fails — same class as a missing zsh on Windows, not a regression.
+
+- **`--adapter-tests [--only <name>]` CLI flag** — shipped in 0.6.0; now documented as the canonical way to exercise adapter-declared tests without the pre-existing `ConsoleWorkerTests.Run` flakes hard-exiting the process. Useful for verifying a new adapter in isolation.
+
+- **`input.clear_line` schema field** documented in SCHEMA.md §8 alongside the empirical-verification requirement ("walk the adapter in ripple, type into its console, confirm the clear bytes wipe the buffer without syntax errors, then add the field"). Bash and zsh opt-in; everything else null by default.
+
+- **ABCL 1.9.2 gotcha in HANDOFF.md** — `--add-opens java.base/java.lang=ALL-UNNAMED` on the Groovy-pattern command template silences the JDK 21 virtual-threading warning ABCL 1.9.2 prints on every cold start.
+
+- **Pre-existing E2E flake documentation in HANDOFF.md** — the two `ConsoleWorkerTests.Run` tests (Ctrl+C post-interrupt standby, obsolete PTY alive) and the `--adapter-tests` standalone workaround. Invisible to release binaries; only affects `--test --e2e` during development.
 
 ### Changed
-- **`SignalsSpec.Interrupt` is now `string?`.** The YAML default
-  stays `"\x03"` for adapters that omit the field, but adapters
-  with destructive Ctrl-C handlers (groovy today, future hosts
-  that kill the process on Ctrl-C) can now set `interrupt: null`
-  in YAML to signal "no safe interrupt byte available".
-- **Mode detection poll window.** `ConsoleWorker.HandleExecuteAsync`
-  now waits up to 150 ms for a non-default auto_enter mode to
-  appear in the raw ring after a command resolves. Happy path
-  (default mode) returns immediately; transitions that need the
-  post-A prompt bytes to arrive get up to 150 ms of headroom.
-- **`capabilities.interrupt`** for node and groovy flipped to
-  `false`. MCP clients querying the flag now see the honest
-  story: sending Ctrl-C to either host will NOT rescue a runaway
-  command.
+
+- **`SignalsSpec.Interrupt` is now `string?`.** YAML default stays `"\x03"`; adapters with destructive Ctrl-C handlers (groovy today, future hosts) can set `interrupt: null` to signal "no safe interrupt byte available".
+
+- **Mode detection poll window.** `HandleExecuteAsync` now waits up to 150 ms for a non-default auto_enter mode to appear in the raw ring after a command resolves. Happy path (default mode) returns immediately; transitions get up to 150 ms of headroom.
+
+- **`capabilities.interrupt` flipped to `false`** for node and groovy. MCP clients querying the flag now see the honest story: sending Ctrl-C will NOT rescue a runaway command.
 
 ## [0.6.0] - 2026-04-15
 
-Cache-on-busy-receive salvage layer plus a second Common Lisp adapter. When a command is in flight and the MCP client silently drops the response channel — ESC cancel, the MCP protocol's 3-minute ceiling, or a fresh tool call sneaking in on the same console — the worker flips the in-flight command to cache-on-complete mode so its eventual result lands in a per-console list instead of being silently discarded. The next tool call — **any** tool call, not just execute_command — drains the list and surfaces the result to the AI. Mirrors the PowerShell.MCP pattern, then closes three implementation holes observed in its reference. And: **Armed Bear Common Lisp** (ABCL) joins the embedded adapter set, giving ripple a JVM-hosted Lisp reference point for the `balanced_parens` counter and proving the **Groovy pattern** (java.exe from a whitelisted Program Files path loading a jar payload from `%LocalAppData%`) works for any future JVM-hosted REPL. 536 / 536 test assertions pass (408 unit + 79 pre-existing E2E + 49 adapter-declared).
+**Cache-on-busy-receive salvage layer.** When a command is in flight and the MCP client silently drops the response channel — ESC cancel, the MCP protocol's 3-minute ceiling, or a fresh tool call sneaking in on the same console — the worker flips the in-flight command to cache-on-complete mode so its eventual result lands in a per-console list instead of being silently discarded. The next tool call — **any** tool call, not just `execute_command` — drains the list and surfaces the result to the AI. Mirrors the PowerShell.MCP pattern, then closes three implementation holes observed in its reference.
+
+**Armed Bear Common Lisp (ABCL) joins the embedded adapter set**, giving ripple a JVM-hosted Lisp reference for the `balanced_parens` counter and proving the **Groovy pattern** (java.exe from a whitelisted Program Files path loading a jar payload from `%LocalAppData%`) works for any future JVM-hosted REPL. 536 / 536 assertions pass (408 unit + 79 pre-existing E2E + 49 adapter-declared).
 
 ### Added
-- **`CommandTracker.FlipToCacheMode()`** — detaches the in-flight TCS with a `TimeoutException` and marks `_shouldCacheOnComplete` so the eventual OSC-driven `Resolve()` appends to `_cachedResults` instead of delivering to the original caller. Invoked by two paths: the `CancellationTokenSource` registration firing at the 170 s preemptive deadline, and `HandleExecuteAsync` catching a fresh `execute_command` on a busy console (proof the prior caller stopped listening).
-- **Multi-entry cached results per console** — `_cachedResults: List<CommandResult>` replaces the old single-slot `_cachedResult?` so sequential flipped commands accumulate without racing to overwrite. `ConsumeCachedOutputs()` drains the whole list atomically in one call, and `get_cached_output` returns a `results` array over the pipe protocol.
-- **170 s preemptive timeout cap** — `CommandTracker.PreemptiveTimeoutMs = 170_000` and `ConsoleManager.MaxExecuteTimeoutSeconds = 170` clamp both the worker-side timer and the proxy-side pipe wait, so `execute_command` always returns a usable response within the MCP 3-minute tool-call window even when the underlying command keeps running in the background.
-- **Worker-baked status line on cached results** — `CommandTracker.SetDisplayContext(displayName, shellFamily)` (populated from `claim` / `set_title`) lets the worker compute a self-describing status line at `Resolve` time. `CommandResult.StatusLine` carries it through the pipe, `ExecuteResult.StatusLine` carries it through the proxy, and `ShellTools.AppendCachedOutputs` prefers it over proxy-side reformatting so drained output reads identically to inline results — even if the console has since been reused.
-- **84 new cache/drain test assertions** — 76 `CommandTrackerTests` unit tests for flip semantics, list accumulation, atomic drain, status-line formatting (pwsh / cmd / bash variants), cache survival across `RegisterCommand`, the 170 s cap, and a wall-clock preemptive-timer path; 8 `ConsoleWorkerTests` E2E assertions covering the multi-entry wire protocol — two back-to-back short-timeout commands stack in the cache and drain in a single RPC with both status lines intact, follow-up drain returns `no_cache`.
-- **Armed Bear Common Lisp (ABCL) adapter** — `adapters/abcl.yaml` + `ShellIntegration/integration.abcl.lisp`. Second Common Lisp family adapter, first JVM-hosted Lisp shipped embedded. Runs ABCL 1.9.2 from `%LocalAppData%\ripple-deps\abcl-bin-1.9.2\` via `java.exe` from Program Files — the same **Groovy pattern** that bypasses AppLocker's user-dir PE block by keeping the only spawned executable in a whitelisted location and loading the jar payload as classfiles. The integration script `setf`s `top-level::*repl-prompt-fun*` to an OSC-emitting wrapper — simpler than CCL's `ccl::print-listener-prompt` override which needs a kernel-redefine warning gate. Prompt is overridden from ABCL's default `CL-USER(N): ` to a literal `? ` so both CL adapters share mode regexes. `balanced_parens` / `char_literal_prefix` / tempfile delivery / `modes.main` mirror `ccl.yaml`. Probe + 5 declared tests (arithmetic, `defparameter` persistence, block comment `#| |#`, char literal `#\(`, modes-main default) all pass on `--adapter-tests --only abcl`. Debugger mode intentionally deferred because ABCL's `system::debug-loop` uses a separate prompt mechanism that needs research against a real break scenario.
-- **`--adapter-tests [--only <name>]` CLI flag** — runs each adapter's declared `tests:` block standalone, without the `ConsoleWorkerTests.Run` harness whose pre-existing Ctrl+C / obsolete-state flakes hard-exit the process on failure and would otherwise mask downstream adapter-declared results. Useful after adding a new adapter to verify just its own tests in isolation (e.g. `--adapter-tests --only abcl`) or to run the full declared-test suite across all loaded adapters independently of the broader `--test --e2e` gate.
+
+- **`CommandTracker.FlipToCacheMode()`** detaches the in-flight TCS with a `TimeoutException` and marks `_shouldCacheOnComplete` so the eventual OSC-driven `Resolve()` appends to `_cachedResults` instead of delivering to the original caller. Invoked by two paths: the 170 s preemptive deadline firing, and `HandleExecuteAsync` catching a fresh `execute_command` on a busy console (proof the prior caller stopped listening).
+
+- **Multi-entry cached results per console.** `_cachedResults: List<CommandResult>` replaces the old single-slot so sequential flipped commands accumulate without racing to overwrite. `ConsumeCachedOutputs()` drains the whole list atomically; `get_cached_output` returns a `results` array.
+
+- **170 s preemptive timeout cap.** `CommandTracker.PreemptiveTimeoutMs = 170_000` and `ConsoleManager.MaxExecuteTimeoutSeconds = 170` clamp both worker-side timer and proxy-side pipe wait, so `execute_command` always returns within the MCP 3-minute window even when the command keeps running in the background.
+
+- **Worker-baked status line on cached results.** `SetDisplayContext(displayName, shellFamily)` lets the worker compute a self-describing status line at `Resolve` time, threaded through `CommandResult.StatusLine` → `ExecuteResult.StatusLine`. `AppendCachedOutputs` prefers it over proxy-side reformatting so drained output reads identically to inline results — even if the console has since been reused.
+
+- **84 new cache / drain test assertions** — 76 `CommandTrackerTests` (flip semantics, list accumulation, atomic drain, status-line formatting per shell, cache survival across `RegisterCommand`, 170 s cap, wall-clock preemptive-timer path) + 8 `ConsoleWorkerTests` E2E covering the multi-entry wire protocol (back-to-back short-timeout commands stack and drain in one RPC).
+
+- **Armed Bear Common Lisp (ABCL) adapter** — `adapters/abcl.yaml` + `ShellIntegration/integration.abcl.lisp`. Second CL adapter, first JVM-hosted Lisp embedded. Runs ABCL 1.9.2 from `%LocalAppData%\ripple-deps\abcl-bin-1.9.2\` via `java.exe` from Program Files — the **Groovy pattern** that bypasses AppLocker's user-dir PE block. Integration script `setf`s `top-level::*repl-prompt-fun*` to an OSC-emitting wrapper — simpler than CCL's `ccl::print-listener-prompt` override. Prompt overridden from `CL-USER(N): ` to literal `? ` so both CL adapters share mode regexes. Probe + 5 tests pass on `--adapter-tests --only abcl`. Debugger mode deferred (ABCL's `system::debug-loop` uses a separate prompt mechanism).
+
+- **`--adapter-tests [--only <name>]` CLI flag** — runs each adapter's declared `tests:` block standalone, without the `ConsoleWorkerTests.Run` harness whose pre-existing flakes hard-exit on failure. Useful for verifying a new adapter in isolation.
 
 ### Changed
 - **`execute_command` timeout cap** — the tool's `timeout_seconds` still defaults to 30 but now hard-caps at 170 s; larger values are silently clamped. Worker-side `RegisterCommand` applies the same cap internally so the pipe wait and worker timer both unwind inside the MCP 3-minute window.
@@ -513,7 +351,7 @@ Cache-on-busy-receive salvage layer plus a second Common Lisp adapter. When a co
 
 ## [0.5.0] - 2026-04-13
 
-A round of cmd.exe and bash polish driven by systematic shell-by-shell testing. cmd is now usable for AI commands instead of hanging indefinitely; bash subshells and command substitutions resolve correctly; pwsh integration tolerates a missing PSReadLine module without crashing the worker. 240 / 240 tests pass.
+**cmd.exe and bash polish driven by systematic shell-by-shell testing.** cmd is now usable for AI commands instead of hanging indefinitely. bash subshells and command substitutions resolve correctly. pwsh integration tolerates a missing PSReadLine module without crashing the worker. 240 / 240 tests pass.
 
 ### Added
 - **cmd.exe AI command support** — multi-line cmd commands (heredoc-equivalent batch blocks, `if/else`, `for /l`, `setlocal enabledelayedexpansion` with `!VAR!`) now work via a tempfile `.cmd` wrapper called from a single-line PTY input. ConPTY's input echo is stripped from the captured slice via `StripCmdInputEcho` so AI output mirrors what pwsh and bash produce.
@@ -540,6 +378,8 @@ A round of cmd.exe and bash polish driven by systematic shell-by-shell testing. 
 
 ## [0.4.0] - 2026-04-12
 
+**Visible-console rescue tools.** New `peek_console` (read-only snapshot of what a console is displaying) and `send_input` (raw keystrokes to a busy console's PTY) let the AI diagnose and respond to stuck commands without waiting for completion. `execute_command` timeouts now include a `partialOutput` snapshot for immediate diagnosis. Plus multi-line PowerShell support via tempfile dot-sourcing, and a 4 KB recent-output ring fed through a multi-row VT interpreter so the snapshot reads as the human sees the screen.
+
 ### Added
 - **`peek_console` tool** — read-only snapshot of what a console is currently displaying. On Windows, reads the console screen buffer directly via `ReadConsoleOutputCharacterW` for an exact match with the visible terminal. On Linux/macOS, falls back to a built-in VT-medium terminal interpreter with fixed viewport, scrolling, alternate screen buffer, and save/restore cursor. Accepts a console selector (PID or display-name substring) or defaults to the active console.
 - **`send_input` tool** — send raw keystrokes to a busy console's PTY input. Supports C-style escape sequences (`\r` for Enter, `\x03` for Ctrl+C, `\x1b[A` for arrow up, `\\` for literal backslash). Rejected when the console is idle (use `execute_command` instead). Console must be specified explicitly for safety. Max 256 chars per call.
@@ -565,7 +405,7 @@ A round of cmd.exe and bash polish driven by systematic shell-by-shell testing. 
 
 ## [0.3.0] - 2026-04-11
 
-A quality-focused release built on top of the v0.2.0 foundation. pwsh is now stable and polished; bash / zsh / cmd are functional but lag on a few items. Drop-in upgrade from v0.2.0.
+**Quality-focused polish on the v0.2.0 foundation.** pwsh is now stable and polished. bash / zsh / cmd are functional but lag on a few items. Drop-in upgrade from v0.2.0. Headline additions: PSReadLine-equivalent syntax-highlighted echo of AI commands, background busy / finished / closed reports on every tool response, source-cwd drift handling when auto-routing around a busy console, and a NativeAOT publish path that drops cold start from ~1 s to ~130 ms.
 
 ### Added
 - **Syntax-highlighted AI command echo** — pwsh and Windows PowerShell 5.1 both render the echoed command with PSReadLine-equivalent colors: cmdlets, keywords (`foreach`, `in`, `if`, `else`, ...), scriptblock bodies (`Write-Host` inside `{ ... }`), double-quoted string interpolation (`"- $i"`), parameters, variables, numbers and comments. Hand-rolled state machine in `Services/PwshColorizer.cs` with unit tests.
@@ -598,24 +438,28 @@ A quality-focused release built on top of the v0.2.0 foundation. pwsh is now sta
 
 ## [0.2.0] - 2026-04-10
 
+**Claim-handshake version check + npx install path.** A strictly newer proxy attaching to an older worker is refused; the old worker marks itself obsolete and stops serving pipes while keeping the PTY alive for the human user, so the MCP session disconnects cleanly without killing the shell.
+
 ### Added
-- **Claim-handshake version check** — a strictly newer proxy trying to attach to an older worker is refused; the old worker marks itself obsolete and stops serving pipes while keeping the PTY alive for the human user, so the MCP session disconnects cleanly without killing the shell.
-- **npx-based install docs** — README now documents `npx splashshell` as the primary install path.
+
+- **Claim-handshake version check.** Old worker refuses newer proxy, marks itself obsolete, stops serving pipes, keeps the PTY alive for the human.
+- **npx-based install docs.** README documents `npx splashshell` as the primary install path.
 
 ## [0.1.0] - 2026-04-10
 
-First published release, rebranded from the internal `shellpilot` codename.
+**First published release**, rebranded from the internal `shellpilot` codename. ConPTY backend with OSC 633 shell integration, multi-shell support (bash / pwsh / powershell.exe / cmd.exe in parallel workers), console re-claim across proxy restarts, per-console cwd tracking, and the core MCP tool set (`start_console`, `execute_command`, `wait_for_completion`, plus file primitives).
 
 ### Added
+
 - **ConPTY backend** with shell integration via OSC 633 sequences (PromptStart / CommandInputStart / CommandExecuted / CommandFinished / Cwd).
-- **Multi-shell support** — bash, pwsh, powershell.exe, cmd.exe can run simultaneously, each in its own worker process with its own Named Pipe.
-- **Console re-claim** — worker survives proxy death and can be picked up by a new proxy on the unowned pipe so the human user never loses their shell when Claude Code restarts.
+- **Multi-shell support** — bash, pwsh, powershell.exe, cmd.exe run simultaneously, each in its own worker process with its own Named Pipe.
+- **Console re-claim** — worker survives proxy death; a new proxy can pick it up on the unowned pipe so the human never loses their shell when Claude Code restarts.
 - **Per-console window titles** — `#PID Name` when owned, `#PID ____` when unowned.
-- **Per-console cwd tracking** — `LastAiCwd` per console, auto cd on switch, detection of busy active console.
-- **Banner and reason** display on `start_console`, with format-aware layout.
-- **MCP tools**: `start_console`, `execute_command`, `wait_for_completion`, plus file tools (`read_file`, `write_file`, `edit_file`, `find_files`, `search_files`).
+- **Per-console cwd tracking** — `LastAiCwd`, auto cd on switch, detection of busy active console.
+- **Banner and reason** display on `start_console` with format-aware layout.
+- **MCP tools** — `start_console`, `execute_command`, `wait_for_completion`, plus file primitives (`read_file`, `write_file`, `edit_file`, `find_files`, `search_files`).
 - **Cached output drain** on every MCP tool call so timed-out AI commands surface their result automatically.
-- **Closed-console notifications** so the AI learns when a console has been closed since the last tool call.
-- **User input forwarding** from the visible console to ConPTY, so the human can still type in the shared terminal (Ctrl+C, interactive prompts, etc).
+- **Closed-console notifications** so the AI learns when a console has been closed since the last call.
+- **User input forwarding** from the visible console to ConPTY, so the human can still type in the shared terminal (Ctrl+C, interactive prompts).
 - **OSC 0 window title preservation** against shell overrides.
-- **Shell type + cwd** included in `start_console` response and in status lines.
+- **Shell type + cwd** in `start_console` response and status lines.
