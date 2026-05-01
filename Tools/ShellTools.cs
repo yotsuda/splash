@@ -27,6 +27,69 @@ public class ShellTools
     private static string StripAnsi(string s) =>
         string.IsNullOrEmpty(s) ? s : s_sgrPattern.Replace(s, "");
 
+    /// <summary>
+    /// Strip well-known fixed startup banners from a peek snapshot. Today
+    /// the only one is PowerShell's "screen reader detected → PSReadLine
+    /// disabled" warning, which appears at the very top of every pwsh
+    /// console launched under non-interactive ConPTY (= every ripple-spawned
+    /// pwsh) and persists in the rolling window for a long time because
+    /// nothing scrolls it out. The AI seeing this on every peek_console
+    /// call is pure noise — same text every time, no actionable signal —
+    /// so we drop it before building the response. Anything we can't
+    /// confidently match stays put.
+    /// </summary>
+    private static string FilterStartupBanners(string snapshot)
+    {
+        if (string.IsNullOrEmpty(snapshot)) return snapshot;
+        if (!snapshot.Contains("Warning: PowerShell detected")) return snapshot;
+
+        var lines = snapshot.Split('\n');
+        var keep = new List<string>(lines.Length);
+        int dropping = 0; // 0 = not in banner; >0 = nth line being dropped
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            var trimmed = line.TrimEnd('\r');
+
+            if (dropping == 0)
+            {
+                if (trimmed.StartsWith("Warning: PowerShell detected"))
+                {
+                    dropping = 1;
+                    continue;
+                }
+                keep.Add(line);
+            }
+            else
+            {
+                // Inside the banner; this line is its continuation. End on
+                // the closing marker, a blank terminator, or a paranoid cap
+                // to avoid eating the entire snapshot if something unusual
+                // happened to the buffer.
+                bool isClosingMarker = trimmed.Contains("Import-Module PSReadLine'.");
+                bool isBlank = trimmed.Length == 0;
+                if (isClosingMarker || isBlank || dropping > 5)
+                {
+                    dropping = 0;
+                    // If we ended on the closing marker and the next line
+                    // is blank, swallow that blank too — the banner visually
+                    // includes the trailing gap, and leaving it produces
+                    // an awkward leading newline in the trimmed output.
+                    if (isClosingMarker && i + 1 < lines.Length
+                        && lines[i + 1].TrimEnd('\r').Length == 0)
+                    {
+                        i++;
+                    }
+                    continue;
+                }
+                dropping++;
+            }
+        }
+
+        return string.Join('\n', keep);
+    }
+
     // Render the structured error-message list as a trailing section
     // in the tool response. Leading "\n\n" so it detaches from the main
     // output body; empty string when there's nothing to render so
@@ -131,8 +194,8 @@ public class ShellTools
         string shell,
         [Description("Timeout in seconds (0-170, default: 30). On timeout, execution continues in the background and output is cached for wait_for_completion. The timeout response includes a partialOutput snapshot so you can diagnose immediately. Increase for known long-running commands (builds, module imports). Use 0 for commands that block on user interaction (pause, Read-Host, read -p) — ripple flips to cache mode as soon as the pipeline is on the PTY so execute_command returns without blocking on the human key press, and the result is drained on the next tool call.")]
         int timeout_seconds = 30,
-        [Description("Strip ANSI SGR (color / bold / reverse-video) escape sequences from the command output before returning. Default false — the visible console keeps colors regardless of this flag (ripple's shared-console model deliberately preserves them for human viewing). Set true to save tokens when the AI caller only needs the text content. Narrow strip: other control sequences (cursor movement, OSC hyperlinks) are already consumed by the renderer and not affected. Only acts on this call's response; cached results drained via wait_for_completion carry their own strip_ansi flag.")]
-        bool strip_ansi = false,
+        [Description("Strip ANSI SGR (color / bold / reverse-video) escape sequences from the command output before returning. Default true — AI callers almost never want raw color codes mixed into the text they reason about, so we strip by default. Set false when you specifically need the color cues, e.g. when you'll be guiding the user through the output and want to point at a red error span or a green diff line by quoting it back with its highlighting intact, or when you're inspecting colored compiler diagnostics and the color carries semantic information you don't want to lose. The visible console keeps colors regardless of this flag — ripple's shared-console model deliberately preserves them for human viewing. Narrow strip: other control sequences (cursor movement, OSC hyperlinks) are already consumed by the renderer and not affected. Only acts on this call's response; cached results drained via wait_for_completion carry their own strip_ansi flag.")]
+        bool strip_ansi = true,
         [Description("Agent ID for sub-agent console isolation.")]
         string? agent_id = null,
         CancellationToken cancellationToken = default)
@@ -183,8 +246,8 @@ public class ShellTools
         ConsoleManager consoleManager,
         [Description("Maximum seconds to wait (default: 30)")]
         int timeout_seconds = 30,
-        [Description("Strip ANSI SGR escape sequences from each drained result's output. Default false. Same semantics as execute_command's strip_ansi: text content only, no cursor/OSC impact, visible console keeps colors regardless.")]
-        bool strip_ansi = false,
+        [Description("Strip ANSI SGR escape sequences from each drained result's output. Default true — same rationale as execute_command's strip_ansi (AI callers rarely want raw color bytes). Set false when you need the color cues, e.g. you'll be quoting the output back to the user to walk them through a colored error span or diff and want the highlighting preserved. Same semantics otherwise: text content only, no cursor/OSC impact, visible console keeps colors regardless.")]
+        bool strip_ansi = true,
         [Description("Agent ID for sub-agent console isolation.")]
         string? agent_id = null,
         CancellationToken cancellationToken = default)
@@ -302,7 +365,8 @@ public class ShellTools
         }
         sb.AppendLine();
         sb.AppendLine("--- recent output ---");
-        sb.Append(string.IsNullOrEmpty(peek.RecentOutput) ? "(empty)" : peek.RecentOutput);
+        var recentFiltered = FilterStartupBanners(peek.RecentOutput);
+        sb.Append(string.IsNullOrEmpty(recentFiltered) ? "(empty)" : recentFiltered);
 
         if (raw && !string.IsNullOrEmpty(peek.RawBase64))
         {
