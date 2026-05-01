@@ -164,4 +164,19 @@ tests:
     setup: "Set-Location $env:TEMP"
     eval: "$PWD.Path"
     expect_cwd_update: true
+  - name: manual_lastexitcode_does_not_leak_in_pipeline
+    # A bare `$LASTEXITCODE = 7` is just a variable assignment — no
+    # native exe ran, so the AI surfacing it as `exit 7` / `LastExit: 7`
+    # would be a phantom failure signal. Pre-fix the resolver gated only
+    # on "did $LASTEXITCODE change this pipeline" (yes), and the manual
+    # assignment leaked through identically to a real `cmd /c exit 7`.
+    # Post-fix the integration script also tracks whether
+    # PreCommandLookupAction ever resolved a command to Application;
+    # without that signal $LASTEXITCODE is not consulted, exit stays 0,
+    # and OSC L is suppressed.
+    eval: |
+      $LASTEXITCODE = 7
+      "x"
+    expect: '^x$'
+    expect_exit_code: 0
 

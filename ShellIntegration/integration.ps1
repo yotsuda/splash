@@ -61,6 +61,47 @@ $global:__rp_ai_pipeline_lec = $null
 # bypassing any Write-Warning proxy), so only errors are counted.
 $global:__rp_err_count_at_cmd_start = 0
 
+# Heuristic: did the last pipeline actually run a native exe? Used by
+# the resolver to suppress phantom `LastExit: N` reports from manual
+# `$LASTEXITCODE = N` assignments in pure-PowerShell pipelines (which
+# updated the variable without any process actually exiting). Walks
+# the command line's AST, looks for CommandAst nodes, and resolves each
+# command name through the session's command discovery filtered to
+# Application — only native exes return a hit. Aliases pointing at
+# natives resolve as Alias here, so e.g. an alias to `git` would NOT
+# flip the flag; that's the conservative direction (fewer false
+# positives), matching the spirit of the fix. Functions that internally
+# invoke a native are also missed for the same reason — accepted as a
+# known limitation of static analysis.
+#
+# Done in the prompt fn (not in PreCommandLookupAction) to avoid any
+# recursion question: the parser + GetCommand calls are pure helpers
+# at this point and don't trigger further command lookups that the
+# action would observe.
+function global:__rp_pipeline_uses_native([string]$commandLine) {
+    if ([string]::IsNullOrWhiteSpace($commandLine)) { return $false }
+    try {
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $commandLine, [ref]$tokens, [ref]$errors)
+        if ($null -eq $ast) { return $false }
+        $cmds = $ast.FindAll(
+            { param($n) $n -is [System.Management.Automation.Language.CommandAst] },
+            $true)
+        foreach ($c in $cmds) {
+            $name = $c.GetCommandName()
+            if ([string]::IsNullOrEmpty($name)) { continue }
+            try {
+                $resolved = $ExecutionContext.SessionState.InvokeCommand.GetCommand(
+                    $name, [System.Management.Automation.CommandTypes]::Application)
+                if ($resolved) { return $true }
+            } catch { }
+        }
+    } catch { }
+    return $false
+}
+
 # Resolve the OSC D exit code and the OSC L payload in one pass, from
 # the five signals the prompt fn has in hand at command finish:
 #
@@ -92,23 +133,34 @@ $global:__rp_err_count_at_cmd_start = 0
 # calc for L was a second pass over the same signals the D calc had
 # already considered) and gives the resolver a single obvious place
 # to evolve.
-function global:__rp_resolve_exit_code([bool]$ok, $lec, $lecAtStart, $aiOk, $aiLec) {
+function global:__rp_resolve_exit_code([bool]$ok, $lec, $lecAtStart, $aiOk, $aiLec, [bool]$nativeSeen) {
     $lecChanged = $lec -ne $lecAtStart
+    # Treat $LASTEXITCODE as authoritative only when (a) it changed this
+    # pipeline AND (b) AST analysis saw at least one native invocation.
+    # Without the native gate, a bare `$LASTEXITCODE = 7` (a plain
+    # variable assignment with no process exit behind it) was
+    # indistinguishable from `cmd /c exit 7`, so the manual assignment
+    # leaked into the status line as `LastExit: 7` and into the D code
+    # as exit 7.
+    $lecAuthoritative = $lecChanged -and $nativeSeen -and $null -ne $lec -and $lec -ne 0
     if ($null -ne $aiOk) {
         # Multi-line AI path: the tempfile stash captured the user's
         # body outcome before the outer `. 'tmp'; Remove-Item '...'`
-        # wrapper reset $?. Use $aiOk / $aiLec verbatim.
+        # wrapper reset $?. Use $aiOk / $aiLec verbatim. AST gating
+        # also applies here.
         $ec = if ($aiOk) { 0 }
-              elseif ($null -ne $aiLec -and $aiLec -ne 0) { $aiLec }
+              elseif ($nativeSeen -and $null -ne $aiLec -and $aiLec -ne 0) { $aiLec }
               else { 1 }
         $overallOk = $aiOk
     } else {
         # Single-line + user-typed path: $? and $LASTEXITCODE are
         # authoritative. $LASTEXITCODE only consulted when $? is false
-        # AND the value was written by this pipeline (otherwise a
-        # stale value from an earlier `cmd /c exit 7` would leak).
+        # AND the value was written by this pipeline AND a native
+        # actually ran (otherwise a stale value from an earlier
+        # `cmd /c exit 7`, or a manual `$LASTEXITCODE = 7` assignment
+        # in pure-PS code, would both leak through).
         $ec = if ($ok) { 0 }
-              elseif ($lecChanged -and $null -ne $lec -and $lec -ne 0) { $lec }
+              elseif ($lecAuthoritative) { $lec }
               else { 1 }
         $overallOk = $ok
     }
@@ -116,10 +168,11 @@ function global:__rp_resolve_exit_code([bool]$ok, $lec, $lecAtStart, $aiOk, $aiL
     # OSC L is emitted ONLY when the pipeline overall succeeded (so D
     # is 0) AND a native exe returned non-zero mid-pipeline. In every
     # other case either D already carries the non-zero exit (pipeline
-    # failed) or there is nothing to report (no native ran, or it
-    # returned 0). Encoding "do not emit" as 0 lets the prompt fn call
-    # site use a plain `-gt 0` gate with no extra null checks.
-    $emitL = $overallOk -and $lecChanged -and $null -ne $lec -and $lec -ne 0
+    # failed) or there is nothing to report (no native ran, no native
+    # returned non-zero, or no LEC delta). Encoding "do not emit" as 0
+    # lets the prompt fn call site use a plain `-gt 0` gate with no
+    # extra null checks.
+    $emitL = $overallOk -and $lecAuthoritative
     $lastExitReport = if ($emitL) { $lec } else { 0 }
 
     return @{
@@ -164,7 +217,13 @@ function global:prompt {
         # __rp_resolve_exit_code so D and L never disagree on what
         # "this pipeline succeeded" means (see that function for the
         # resolution rules).
-        $__rp_res = __rp_resolve_exit_code $ok $lec $lecAtStart $aiOk $aiLec
+        # AST scan of the command line that just finished, used to gate
+        # $LASTEXITCODE-based reporting on "a native exe actually ran".
+        # Done here (not in PreCommandLookupAction) so the GetCommand
+        # call inside the helper can never recursively trigger the
+        # action mid-resolution.
+        $nativeSeen = __rp_pipeline_uses_native $lastCmd.CommandLine
+        $__rp_res = __rp_resolve_exit_code $ok $lec $lecAtStart $aiOk $aiLec $nativeSeen
         $prefix += (__rp_osc_str "D;$($__rp_res.ExitCode)")
 
         # Errors-this-pipeline count via $Error.Count delta. Floor at 0
