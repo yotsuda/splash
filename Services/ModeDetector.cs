@@ -25,6 +25,11 @@ namespace Ripple.Services;
 /// </summary>
 public static class ModeDetector
 {
+    // Adapter-supplied detect/primary patterns are external input. Cap
+    // per-match runtime so a pathological pattern in a user-dropped
+    // ~/.ripple/adapters/*.yaml can't pin the worker on every prompt.
+    private static readonly TimeSpan MatchTimeout = TimeSpan.FromSeconds(1);
+
     /// <summary>
     /// Inspect the tail of <paramref name="recentOutput"/> against
     /// every mode declared in <paramref name="modes"/> and return the
@@ -50,10 +55,12 @@ public static class ModeDetector
             if (string.IsNullOrEmpty(pattern)) continue;
 
             Regex re;
-            try { re = new Regex(pattern, RegexOptions.Multiline); }
+            try { re = new Regex(pattern, RegexOptions.Multiline, MatchTimeout); }
             catch { continue; }
 
-            var match = re.Match(recentOutput);
+            Match match;
+            try { match = re.Match(recentOutput); }
+            catch (RegexMatchTimeoutException) { continue; }
             if (!match.Success) continue;
 
             int? level = null;

@@ -39,9 +39,14 @@ public sealed class RegexPromptDetector
     private string _buffer = "";
     private const int MaxBufferLength = 2048;
 
+    // Adapter-supplied patterns are external input. Cap per-match runtime
+    // so a pathological ^(a+)+$-shape regex in a hand-edited adapter YAML
+    // can't pin a worker thread on every PTY chunk.
+    private static readonly TimeSpan MatchTimeout = TimeSpan.FromSeconds(1);
+
     public RegexPromptDetector(string primaryPattern)
     {
-        _primary = new Regex(primaryPattern, RegexOptions.Compiled | RegexOptions.Multiline);
+        _primary = new Regex(primaryPattern, RegexOptions.Compiled | RegexOptions.Multiline, MatchTimeout);
     }
 
     /// <summary>
@@ -80,6 +85,12 @@ public sealed class RegexPromptDetector
         var (stripped, map) = StripCsiWithMap(searchIn);
 
         int lastReportedOriginalEnd = 0;
+        // Match enumeration may throw RegexMatchTimeoutException for a
+        // pathological adapter pattern. Catch and short-circuit with
+        // whatever we collected so far rather than letting it bubble out
+        // of ReadOutputLoop.
+        try
+        {
         foreach (Match m in _primary.Matches(stripped))
         {
             var strippedEnd = m.Index + m.Length;
@@ -125,6 +136,13 @@ public sealed class RegexPromptDetector
             int chunkEnd = originalEnd - bufferLen;
             matches.Add(new PromptMatch(chunkStart, chunkEnd));
             lastReportedOriginalEnd = originalEnd;
+        }
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            // Adapter pattern hit the per-match cap. Surface what we
+            // already matched and keep going on the next chunk; the
+            // pattern itself isn't going to start completing if we retry.
         }
 
         // Buffer carry-over: keep the original-coordinate tail past the

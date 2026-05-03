@@ -197,7 +197,6 @@ public class InitSpec
     public string? ScriptResource { get; set; }
     public string? Script { get; set; }
     public string? InitInvocationTemplate { get; set; }
-    public int WaitAfterMs { get; set; }
 
     public TempfileSpec? Tempfile { get; set; }
     public BannerInjectionSpec? BannerInjection { get; set; }
@@ -310,7 +309,6 @@ public class OutputSpec
     public int PostPromptSettleMs { get; set; } = 150;
     public bool StripAnsi { get; set; }
     public bool StripInputEcho { get; set; } = true;
-    public bool StripPromptEcho { get; set; } = true;
     public string InputEchoStrategy { get; set; } = "osc_boundaries"; // osc_boundaries | deterministic_byte_match | fuzzy_byte_match | none
     public string LineEnding { get; set; } = "\n";
     public AsyncInterleaveSpec? AsyncInterleave { get; set; }

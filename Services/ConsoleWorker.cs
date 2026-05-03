@@ -4282,11 +4282,20 @@ public class ConsoleWorker
 
     // --- Pipe protocol (length-prefixed JSON) ---
 
+    // Sanity ceiling for an inbound pipe frame. Real messages are
+    // request/response JSON capped well under this; a length prefix
+    // outside [0, MaxPipeFrameBytes] is either a torn frame or a buggy
+    // proxy, and unconditionally allocating `new byte[len]` from a
+    // negative or multi-GiB length would just OOM the worker.
+    private const int MaxPipeFrameBytes = 64 * 1024 * 1024;
+
     private static async Task<JsonElement> ReadMessageAsync(Stream stream, CancellationToken ct)
     {
         var lenBuf = new byte[4];
         await ReadExactAsync(stream, lenBuf, ct);
         var len = BitConverter.ToInt32(lenBuf);
+        if ((uint)len > MaxPipeFrameBytes)
+            throw new IOException($"Pipe frame length {len} out of range (0..{MaxPipeFrameBytes})");
         var msgBuf = new byte[len];
         await ReadExactAsync(stream, msgBuf, ct);
         return PipeJson.ParseElement(msgBuf);
