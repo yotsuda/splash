@@ -1287,11 +1287,17 @@ public class ConsoleManager
     private async Task<(int Pid, string DisplayName)?> FindStandbyConsoleAsync(string agentId, string? shellPath = null)
     {
         // 1. Try owned pipes for this proxy + agent
-        var found = await TryFindInPipesAsync(EnumeratePipes(ProxyPid, agentId), shellPath);
+        var found = await TryFindInPipesAsync(EnumeratePipes(ProxyPid, agentId), agentId, shellPath);
         if (found.HasValue) return found;
 
-        // 2. Try unowned pipes (workers whose original proxy died)
-        found = await TryFindInPipesAsync(EnumerateUnownedPipes(), shellPath);
+        // 2. Try unowned pipes (workers whose original proxy died). The
+        // claiming agent assigns its own id to the adopted console — the
+        // new pipe / claim payload carry `agentId`, so the orphan ends up
+        // routed under the discovering agent's MRU stack rather than a
+        // shared bucket. This keeps cross-agent isolation intact: agent
+        // A discovering an orphan does not give agent B implicit access
+        // to that console on the next tool call.
+        found = await TryFindInPipesAsync(EnumerateUnownedPipes(), agentId, shellPath);
         return found;
     }
 
@@ -1392,7 +1398,7 @@ public class ConsoleManager
         }
     }
 
-    private async Task<(int Pid, string DisplayName)?> TryFindInPipesAsync(IEnumerable<string> pipes, string? shellPath = null)
+    private async Task<(int Pid, string DisplayName)?> TryFindInPipesAsync(IEnumerable<string> pipes, string agentId, string? shellPath = null)
     {
         foreach (var pipe in pipes)
         {
@@ -1465,9 +1471,15 @@ public class ConsoleManager
                     return (pid.Value, displayName);
                 }
 
-                // Unowned console — claim it
+                // Unowned console — claim it under the discovering
+                // agent's id so the resulting RP.{proxy}.{agent}.{pid}
+                // pipe lands in this agent's routing partition. Worker
+                // and proxy must agree on the agent_id baked into the
+                // pipe name; passing the same value in both the claim
+                // payload (worker uses it to rebuild the pipe) and the
+                // pipe name we wait on keeps them aligned.
                 var displayNameNew = AssignConsoleName(pid.Value);
-                var newPipeName = GetPipeName("default", pid.Value);
+                var newPipeName = GetPipeName(agentId, pid.Value);
                 try
                 {
                     var claimResponse = await SendPipeRequestAsync(pipe, w =>
@@ -1475,7 +1487,7 @@ public class ConsoleManager
                         w.WriteString("type", "claim");
                         w.WriteNumber("proxy_pid", ProxyPid);
                         w.WriteString("proxy_version", ProxyVersion);
-                        w.WriteString("agent_id", "default");
+                        w.WriteString("agent_id", agentId);
                         w.WriteString("title", displayNameNew);
                     }, TimeSpan.FromSeconds(3));
 
