@@ -433,7 +433,7 @@ public class FileTools
         }
         else if (Directory.Exists(basePath))
         {
-            await WalkAndSearchAsync(basePath, regex, results, max_results, glob, cancellationToken);
+            await WalkAndSearchAsync(basePath, regex, results, max_results, glob, NewVisitedSet(), cancellationToken);
         }
         else
         {
@@ -456,13 +456,37 @@ public class FileTools
     {
         var dir = path ?? Directory.GetCurrentDirectory();
         var results = new List<string>();
-        FindFilesRecursive(dir, pattern, results, max_results);
+        FindFilesRecursive(dir, pattern, results, max_results, NewVisitedSet());
 
         if (results.Count == 0) return Task.FromResult("No files found.");
         return Task.FromResult(string.Join('\n', results));
     }
 
     // --- Helpers ---
+
+    // Filesystem walk cycle detection. Symlinks / Windows junctions can
+    // form loops (`ln -s . self`, junction pointing at an ancestor); a
+    // naive recursive walk would spin until max_results or stack overflow.
+    // We track each visited directory by its resolved real path and bail
+    // before entering one we've already seen this walk.
+    private static HashSet<string> NewVisitedSet() =>
+        new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+    private static string ResolveRealPath(string dir)
+    {
+        try
+        {
+            var info = new DirectoryInfo(dir);
+            var target = info.ResolveLinkTarget(returnFinalTarget: true);
+            return Path.GetFullPath(target?.FullName ?? info.FullName);
+        }
+        catch
+        {
+            // Inaccessible / malformed entry — fall back to the literal
+            // path so the visited-set still de-dupes by string identity.
+            return Path.GetFullPath(dir);
+        }
+    }
 
     private static async Task SearchInFileAsync(string filePath, Regex regex, List<string> results, int maxResults, CancellationToken ct)
     {
@@ -486,8 +510,10 @@ public class FileTools
         }
     }
 
-    private static async Task WalkAndSearchAsync(string dir, Regex regex, List<string> results, int maxResults, string? globPattern, CancellationToken ct)
+    private static async Task WalkAndSearchAsync(string dir, Regex regex, List<string> results, int maxResults, string? globPattern, HashSet<string> visited, CancellationToken ct)
     {
+        if (!visited.Add(ResolveRealPath(dir))) return;
+
         string[] entries;
         try { entries = Directory.GetFileSystemEntries(dir); }
         catch { return; }
@@ -501,7 +527,7 @@ public class FileTools
             {
                 var name = Path.GetFileName(entry);
                 if (SkipDirs.Contains(name)) continue;
-                await WalkAndSearchAsync(entry, regex, results, maxResults, globPattern, ct);
+                await WalkAndSearchAsync(entry, regex, results, maxResults, globPattern, visited, ct);
             }
             else if (File.Exists(entry))
             {
@@ -511,8 +537,10 @@ public class FileTools
         }
     }
 
-    private static void FindFilesRecursive(string dir, string pattern, List<string> results, int maxResults)
+    private static void FindFilesRecursive(string dir, string pattern, List<string> results, int maxResults, HashSet<string> visited)
     {
+        if (!visited.Add(ResolveRealPath(dir))) return;
+
         string[] entries;
         try { entries = Directory.GetFileSystemEntries(dir); }
         catch { return; }
@@ -525,7 +553,7 @@ public class FileTools
             {
                 var name = Path.GetFileName(entry);
                 if (SkipDirs.Contains(name)) continue;
-                FindFilesRecursive(entry, pattern, results, maxResults);
+                FindFilesRecursive(entry, pattern, results, maxResults, visited);
             }
             else if (File.Exists(entry))
             {
