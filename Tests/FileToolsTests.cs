@@ -362,6 +362,26 @@ public static class FileToolsTests
                 Assert(!result2.Contains("MID4") && !result2.Contains("MID5"),
                     $"streaming gap: middle lines (outside both ±2 windows) suppressed ({result2})");
             }
+
+            // --- ReadFile parameter validation ---
+            {
+                var p = Path.Combine(tmpRoot, "read-validation.txt");
+                File.WriteAllText(p, "line1\nline2\nline3\n", new UTF8Encoding(false));
+
+                var negOffset = FileTools.ReadFile(p, offset: -1).GetAwaiter().GetResult();
+                Assert(negOffset.StartsWith("Error: offset"),
+                    $"ReadFile rejects negative offset ({negOffset})");
+
+                var negLimit = FileTools.ReadFile(p, limit: -5).GetAwaiter().GetResult();
+                Assert(negLimit.StartsWith("Error: limit"),
+                    $"ReadFile rejects negative limit ({negLimit})");
+
+                // Sanity: zero limit is legal (read nothing) and shouldn't error.
+                var zeroLimit = FileTools.ReadFile(p, limit: 0).GetAwaiter().GetResult();
+                Assert(!zeroLimit.StartsWith("Error:"),
+                    $"ReadFile accepts limit=0 ({zeroLimit})");
+            }
+
         }
         finally
         {

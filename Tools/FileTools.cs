@@ -34,6 +34,8 @@ public class FileTools
         [Description("Maximum number of lines to read")] int limit = 2000,
         CancellationToken cancellationToken = default)
     {
+        if (offset < 0) return $"Error: offset must be >= 0 (got {offset})";
+        if (limit < 0) return $"Error: limit must be >= 0 (got {limit})";
         if (!File.Exists(path)) return $"Error: File not found: {path}";
         if (Directory.Exists(path)) return $"Error: Path is a directory: {path}";
         if (IsBinaryFile(path)) return $"Error: Binary file, cannot display: {path}";
@@ -672,6 +674,22 @@ public class FileTools
     private static Regex GetGlobRegex(string globPattern) =>
         _globRegexCache.GetOrAdd(globPattern, p => new Regex(
             "^" + Regex.Escape(p)
+                // `/**/` collapses zero or more path segments — `src/**/test.js`
+                // must match `src/test.js` AND `src/a/test.js` AND
+                // `src/a/b/test.js`, matching Bash globstar / npm minimatch
+                // semantics. Without this special case the post-Escape
+                // pattern `src/.*/test\.js` requires at least the slashes
+                // around `.*` and rejects the top-level `src/test.js`.
+                // NOTE: MatchGlob is wired up by FindFiles to match either
+                // the basename or the full absolute path of each entry,
+                // and uses literal `/` as the separator. That means glob
+                // patterns containing path segments (e.g. `src/**/*.cs`)
+                // don't engage usefully on Windows full paths (which use
+                // `\\`) and never engage on the basename. Fixing those
+                // requires matching against root-relative paths with a
+                // platform-aware separator class, which is outside the
+                // scope of this regex-semantics fix.
+                .Replace(@"/\*\*/", "/(?:.*/)?")
                 .Replace(@"\*\*", ".*")
                 .Replace(@"\*", @"[^/\\]*")
                 .Replace(@"\?", ".") + "$",
