@@ -365,6 +365,23 @@ Write-Host -NoNewline (__rp_osc_str "B")
 # stops getting OSC B (user-busy detection) and the tempfile dot-source
 # lines leak into history — both observability concerns, not correctness.
 if (Get-Module PSReadLine) {
+    # Disable inline prediction (Predictive IntelliSense) in the worker
+    # pwsh. The worker is an automation shell: ripple writes AI command
+    # payloads into it as if typed, so PSReadLine's predictor renders
+    # history-based ghost text (default SGR 38;2;68;68;68) over the line
+    # while a long encoded_scriptblock payload streams in. That redraw
+    # interleaves with the input echo and the osc_boundaries stripper
+    # can't cleanly separate it, so the captured command output gets
+    # corrupted — intermittently, depending on the user's history and
+    # timing (ripple#9: flaky pwsh adapter tests on a box with populated
+    # history; never reproduces with empty history). No human reads the
+    # prediction in an AI-driven worker, so this loses nothing here.
+    # PredictionSource is the ONLY thing turned off — history recall
+    # (Up/Down, Ctrl-R), Tab completion, and syntax highlighting all
+    # keep working — and it touches only ripple's worker shell, never
+    # the user's normal pwsh session.
+    try { Set-PSReadLineOption -PredictionSource None } catch { }
+
     # Override Enter to emit OSC B and arm the "next command lookup is a
     # user command" flag. The actual OSC C fires from PreCommandLookupAction
     # a moment later, right before the command runs — by then PSReadLine's
