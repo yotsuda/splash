@@ -2,7 +2,11 @@ namespace Ripple.Services.Adapters;
 
 /// <summary>
 /// Immutable in-memory registry of loaded adapters, keyed by canonical name
-/// and alias. Constructed once at startup via AdapterRegistry.LoadEmbedded.
+/// and alias. Constructed once at startup via <see cref="LoadDefault"/>
+/// (Program.cs) — embedded adapters plus any YAMLs in the external
+/// directory (<see cref="DefaultExternalDirectory"/>), where external
+/// overrides embedded. <see cref="LoadEmbedded"/> (embedded-only) exists
+/// for tests and is not the runtime entrypoint.
 ///
 /// Lookup is case-insensitive on the shell family name, matching the
 /// existing ConsoleManager.NormalizeShellFamily convention (bash, pwsh, cmd,
