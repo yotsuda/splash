@@ -1,6 +1,6 @@
 {
   "name": "@ytsuda/ripple-win32-x64",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "description": "Windows x64 binary for @ytsuda/ripple.",
   "license": "MIT",
   "author": "Yoshifumi Tsuda",

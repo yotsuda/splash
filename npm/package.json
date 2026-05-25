@@ -1,6 +1,6 @@
 {
   "name": "@ytsuda/ripple",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "description": "REPL-sharing MCP server — AI and humans co-drive the same visible terminal. 19 embedded adapters: shells (bash, pwsh, zsh, cmd), language REPLs (Python, Node, Deno, Lua, Racket, CCL/ABCL/SBCL Common Lisp, F# Interactive, jshell, Groovy, SQLite3), and debuggers (pdb, perldb, jdb). Session persists across tool calls; secrets typed in the visible window stay out of AI's view.",
   "license": "MIT",
   "author": "Yoshifumi Tsuda",
@@ -46,9 +46,9 @@
     "ripple": "bin/cli.mjs"
   },
   "optionalDependencies": {
-    "@ytsuda/ripple-win32-x64": "0.14.0",
-    "@ytsuda/ripple-linux-x64": "0.14.0",
-    "@ytsuda/ripple-darwin-arm64": "0.14.0"
+    "@ytsuda/ripple-win32-x64": "0.14.1",
+    "@ytsuda/ripple-linux-x64": "0.14.1",
+    "@ytsuda/ripple-darwin-arm64": "0.14.1"
   },
   "files": [
     "bin/",

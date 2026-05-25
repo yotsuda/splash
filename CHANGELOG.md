@@ -2,6 +2,14 @@
 
 All notable changes to ripple are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.14.1] - 2026-05-26
+
+**Single fix for a history-dependent pwsh worker output corruption.** When ripple's worker pwsh ran on a box with populated command history, PSReadLine's Predictive IntelliSense rendered grey ghost text (SGR `38;2;68;68;68`) over the line while a long encoded-scriptblock payload was streaming in; that redraw interleaved with the input echo and intermittently corrupted captured command output — enough to fail the pwsh adapter probe outright on some machines. Reported in [#9](https://github.com/yotsuda/ripple/issues/9).
+
+### Fixed
+
+- **PSReadLine Predictive IntelliSense disabled in the pwsh worker shell.** `ShellIntegration/integration.ps1` now runs `Set-PSReadLineOption -PredictionSource None` in ripple's worker pwsh. Only the predictor is turned off — history recall (Up/Down, Ctrl-R), Tab completion, and syntax highlighting are unaffected — and it touches ripple's automation shell only, never the user's interactive pwsh session. No human reads the inline prediction in an AI-driven worker, so the change loses nothing there.
+
 ## [0.14.0] - 2026-05-08
 
 **AI-ergonomics polish + a correctness/robustness sweep across file-tools, OSC parsing, console routing, and worker lifecycle.** `peek_console` drops the PSReadLine "screen reader detected" warning ConPTY-launched pwsh reprints on every snapshot. `LastExit: N` no longer surfaces for bare `$LASTEXITCODE = N` assignments — only when AST analysis confirms a native exe actually ran. `EditFile` streams in one pass and emits ±2 lines of context per replacement so the AI doesn't have to re-read the file to confirm the change. File-tools moved to `Microsoft.Extensions.FileSystemGlobbing.Matcher` (path-segment globs now work correctly on Windows), gained symlink/junction cycle detection, and retry on transient AV/indexer sharing violations. Drift handling bails with a "Pipeline NOT executed" notice instead of silently re-injecting a `cd` preamble — the AI re-issues to accept the user's cwd or prepends the revert hint.
